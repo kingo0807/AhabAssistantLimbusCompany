@@ -1,350 +1,477 @@
+from __future__ import annotations
+
+import argparse
+import ctypes
+import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 import psutil
 
+UPDATER_VERSION = "1.0.0"
+REPOSITORY = "kingo0807/AhabAssistantLimbusCompany"
+LATEST_RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
+MANIFEST_ASSET_NAME = "update-manifest.json"
+DEFAULT_PACKAGE_ASSET = "AALC-Optimized-win64.zip"
+ENTRYPOINT = "AALC.exe"
+USER_AGENT = f"AALC-Optimized-Updater/{UPDATER_VERSION}"
+PRESERVE_FILES = ("config.yaml", "theme_pack_list.yaml")
+PRESERVE_GLOBS = ("config.yaml.*",)
+PRESERVE_DIRECTORIES = ("config_backup", "logs", "pythonlogs", "theme_pack_weight")
+CREATE_NEW_CONSOLE = 0x00000010
+CREATE_NO_WINDOW = 0x08000000
 
-class UpdateManifestError(ValueError):
-    """更新清单包含不能安全应用的内容。"""
+
+class UpdaterError(RuntimeError):
+    """更新无法安全完成。"""
 
 
-class Updater:
-    """应用程序更新器，负责检查、下载、解压和安装最新版本的应用程序。"""
+@dataclass(frozen=True)
+class ReleaseAsset:
+    name: str
+    url: str
+    size: int | None
 
-    def __init__(self, file_name=None):
-        self.process_names = ["AALC.exe"]
-        self.updater_name = "AALC Updater.exe"
-        self.apply_updater_name = "AALC Updater.apply.exe"
 
-        self.temp_path = os.path.abspath("./update_temp")
-        os.makedirs(self.temp_path, exist_ok=True)
+@dataclass(frozen=True)
+class UpdateManifest:
+    version: str
+    asset: str
+    sha256: str
+    size: int | None
+    entrypoint: str
+    archive_root: str
 
-        self.file_name = file_name
+    @classmethod
+    def from_json(cls, payload: Any, release_tag: str) -> "UpdateManifest":
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise UpdaterError("更新清单格式或版本不受支持")
 
-        self.cover_folder_path = os.path.abspath("./")
+        version = payload.get("version")
+        asset = payload.get("asset")
+        sha256 = payload.get("sha256")
+        size = payload.get("size")
+        entrypoint = payload.get("entrypoint", ENTRYPOINT)
+        archive_root = payload.get("archive_root", "AALC")
 
-        self.exe_path = os.path.abspath("./assets/binary/7za.exe")
-        self.delete_folder_path = os.path.abspath("./assets/images")
-        self.changes_file_path = os.path.abspath("./update_temp/changes.json")
-
-        if self.file_name is None:
-            self.download_file_path = None
-            self.extract_folder_path = self.temp_path
-        else:
-            self.download_file_path = os.path.join(self.temp_path, self.file_name)
-            self.extract_folder_path = os.path.join(self.temp_path, self.file_name.rsplit(".", 1)[0])
-
-        self._incremental_update_plan = None
-
-    def extract_file(self):
-        """解压下载的文件。"""
-        print("开始解压...")
-        while True:
-            try:
-                self._reset_extraction_workspace()
-                if os.path.exists(self.exe_path):
-                    subprocess.run(
-                        [
-                            self.exe_path,
-                            "x",
-                            self.download_file_path,
-                            f"-o{self.temp_path}",
-                            "-aoa",
-                        ],
-                        check=True,
-                    )
-                else:
-                    shutil.unpack_archive(self.download_file_path, self.temp_path)
-                print("解压完成")
-                return True
-            except Exception:
-                input("解压失败，按回车键重新解压. . .多次失败请手动下载更新")
-                return False
-
-    def _reset_extraction_workspace(self):
-        """清理本次解压目标，避免复用上一次更新残留的载荷或清单。"""
-        if not self.download_file_path:
-            return
-
-        if self.extract_folder_path and os.path.isdir(self.extract_folder_path):
-            shutil.rmtree(self.extract_folder_path)
-        if self.changes_file_path and os.path.exists(self.changes_file_path):
-            os.remove(self.changes_file_path)
-
-    def cover_folder(self):
-        """覆盖安装最新版本的文件。"""
-        if os.path.exists(self.changes_file_path):
-            self._apply_incremental_update()
-        else:
-            try:
-                shutil.rmtree(self.delete_folder_path)
-            except FileNotFoundError:
-                print("待删除目录不存在，跳过")
-            except Exception as e:
-                print(f"删除旧资源文件失败: {e}")
-            print("开始覆盖安装...")
-            while True:
-                try:
-                    shutil.copytree(self.extract_folder_path, self.cover_folder_path, dirs_exist_ok=True)
-                    print("覆盖安装完成")
-                    break
-                except Exception as e:
-                    print(f"覆盖安装失败: {e}")
-                    input("按回车键重试. . . \n Press any key to continue")
-
-    def _apply_incremental_update(self):
-        """根据 changes.json 执行增量更新。"""
-        changes = self._incremental_update_plan or self._load_incremental_update_plan()
-
-        print("检测到增量更新清单，执行增量更新...")
-
-        for dir_path, full_path in changes["deleted_dir"]:
-            try:
-                shutil.rmtree(full_path)
-                print(f"删除目录: {dir_path}")
-            except FileNotFoundError:
-                print(f"删除目录不存在: {dir_path}")
-
-        for file_path, full_path in changes["deleted"]:
-            try:
-                os.remove(full_path)
-                print(f"删除文件: {file_path}")
-            except FileNotFoundError:
-                print(f"删除文件不存在: {file_path}")
-
-        for dir_path, full_path in changes["added_dir"]:
-            os.makedirs(full_path, exist_ok=True)
-            print(f"创建目录: {dir_path}")
-
-        for file_path, src, dst in changes["added"]:
-            try:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
-                print(f"新增文件: {file_path}")
-            except FileNotFoundError:
-                print(f"源文件不存在: {file_path}")
-
-        for file_path, src, dst in changes["modified"]:
-            try:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
-                print(f"更新文件: {file_path}")
-            except FileNotFoundError:
-                print(f"源文件不存在: {file_path}")
-
-        print("增量更新完成")
-
-    def _normalize_manifest_path(self, relative_path):
-        """兼容带归档根目录前缀与普通相对路径的增量清单。"""
-        if not isinstance(relative_path, str) or not relative_path or "\0" in relative_path:
-            raise UpdateManifestError("更新清单包含空路径或非字符串路径")
-
-        portable_path = relative_path.replace("\\", "/")
-        if portable_path.startswith("/") or (len(portable_path) >= 2 and portable_path[1] == ":"):
-            raise UpdateManifestError(f"更新清单包含绝对路径: {relative_path}")
-
-        raw_parts = PurePosixPath(portable_path).parts
-        if any(part == ".." or ":" in part for part in raw_parts):
-            raise UpdateManifestError(f"更新清单包含非法相对路径: {relative_path}")
-
-        parts = [part for part in raw_parts if part not in ("", ".")]
-        if not parts:
-            raise UpdateManifestError("更新清单包含空路径")
-
-        archive_root_name = os.path.basename(os.path.normpath(self.extract_folder_path))
-        if os.path.normcase(parts[0]) == os.path.normcase(archive_root_name):
-            parts = parts[1:]
-
-        if not parts:
-            raise UpdateManifestError("更新清单不能指向归档根目录")
-
-        return os.path.join(*parts)
-
-    @staticmethod
-    def _resolve_path_within_root(root_path, relative_path):
-        """解析路径并拒绝经父目录或链接离开可信根目录的情况。"""
+        if version != release_tag:
+            raise UpdaterError(f"更新清单版本 {version!r} 与 Release {release_tag!r} 不一致")
+        if not isinstance(asset, str) or not asset.lower().endswith(".zip"):
+            raise UpdaterError("更新清单没有有效的 ZIP 资产名")
+        if not isinstance(sha256, str) or len(sha256) != 64:
+            raise UpdaterError("更新清单没有有效的 SHA-256")
         try:
-            root = Path(root_path).resolve()
-            candidate = (root / relative_path).resolve()
-        except OSError as exc:
-            raise UpdateManifestError(f"无法解析更新清单路径: {relative_path}") from exc
-        try:
-            candidate.relative_to(root)
+            int(sha256, 16)
         except ValueError as exc:
-            raise UpdateManifestError(f"更新清单路径逃离可信根目录: {relative_path}") from exc
-        return os.fspath(candidate)
+            raise UpdaterError("更新清单的 SHA-256 不是十六进制") from exc
+        if size is not None and (not isinstance(size, int) or size <= 0):
+            raise UpdaterError("更新清单的文件大小无效")
+        if entrypoint != ENTRYPOINT:
+            raise UpdaterError(f"更新入口必须是 {ENTRYPOINT}")
+        if archive_root != "AALC":
+            raise UpdaterError("更新压缩包必须使用 AALC 根目录")
 
-    def _load_incremental_update_plan(self):
+        return cls(version, asset, sha256.lower(), size, entrypoint, archive_root)
+
+
+def _request(url: str, timeout: int = 30):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json, application/octet-stream",
+            "User-Agent": USER_AGENT,
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def fetch_json(url: str) -> Any:
+    try:
+        with _request(url) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise UpdaterError(f"无法读取更新信息：{exc}") from exc
+
+
+def download_file(url: str, destination: Path, expected_size: int | None = None) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_suffix(destination.suffix + ".part")
+    downloaded = 0
+    last_percent = -1
+    try:
+        with _request(url, timeout=60) as response, partial.open("wb") as output:
+            response_size = response.headers.get("Content-Length")
+            total = expected_size or (int(response_size) if response_size and response_size.isdigit() else None)
+            while chunk := response.read(1024 * 1024):
+                output.write(chunk)
+                downloaded += len(chunk)
+                if total:
+                    percent = min(100, downloaded * 100 // total)
+                    if percent // 5 != last_percent // 5:
+                        print(f"下载进度：{percent}%")
+                        last_percent = percent
+        if expected_size is not None and downloaded != expected_size:
+            raise UpdaterError(f"下载大小不符：应为 {expected_size}，实际为 {downloaded}")
+        os.replace(partial, destination)
+    except UpdaterError:
+        partial.unlink(missing_ok=True)
+        raise
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        partial.unlink(missing_ok=True)
+        raise UpdaterError(f"下载更新包失败：{exc}") from exc
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def parse_release(payload: Any) -> tuple[str, dict[str, ReleaseAsset]]:
+    if not isinstance(payload, dict):
+        raise UpdaterError("GitHub Release 响应格式无效")
+    if payload.get("draft") or payload.get("prerelease"):
+        raise UpdaterError("latest Release 不能是草稿或预发布版本")
+    tag = payload.get("tag_name")
+    raw_assets = payload.get("assets")
+    if not isinstance(tag, str) or not tag or not isinstance(raw_assets, list):
+        raise UpdaterError("GitHub Release 缺少版本号或资产列表")
+
+    assets: dict[str, ReleaseAsset] = {}
+    for item in raw_assets:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        url = item.get("browser_download_url")
+        size = item.get("size")
+        if isinstance(name, str) and isinstance(url, str) and url.startswith("https://"):
+            assets[name] = ReleaseAsset(name, url, size if isinstance(size, int) and size > 0 else None)
+    return tag, assets
+
+
+def _safe_archive_member(name: str, archive_root: str) -> Path:
+    if not isinstance(name, str) or not name or "\0" in name:
+        raise UpdaterError("更新压缩包包含空路径")
+    portable = name.replace("\\", "/")
+    pure_path = PurePosixPath(portable)
+    parts = [part for part in pure_path.parts if part not in ("", ".")]
+    if portable.startswith("/") or any(part == ".." or ":" in part for part in parts):
+        raise UpdaterError(f"更新压缩包包含不安全路径：{name}")
+    if not parts or parts[0].casefold() != archive_root.casefold():
+        raise UpdaterError(f"更新压缩包内容必须位于 {archive_root}/ 下：{name}")
+    return Path(*parts)
+
+
+def extract_verified_zip(archive: Path, destination: Path, manifest: UpdateManifest) -> Path:
+    destination.mkdir(parents=True, exist_ok=False)
+    try:
+        with zipfile.ZipFile(archive) as package:
+            infos = package.infolist()
+            if not infos:
+                raise UpdaterError("更新压缩包为空")
+            total_uncompressed = sum(info.file_size for info in infos)
+            if total_uncompressed > 4 * 1024 * 1024 * 1024:
+                raise UpdaterError("更新压缩包解压后超过 4 GiB，已拒绝")
+            for info in infos:
+                relative = _safe_archive_member(info.filename, manifest.archive_root)
+                file_mode = info.external_attr >> 16
+                if stat.S_ISLNK(file_mode):
+                    raise UpdaterError(f"更新压缩包不允许符号链接：{info.filename}")
+                target = destination / relative
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with package.open(info) as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise UpdaterError(f"无法安全解压更新包：{exc}") from exc
+
+    payload_root = destination / manifest.archive_root
+    if not (payload_root / manifest.entrypoint).is_file():
+        raise UpdaterError(f"更新包缺少入口文件 {manifest.entrypoint}")
+    return payload_root
+
+
+def _copy_preserved_data(source: Path, destination: Path) -> None:
+    for name in PRESERVE_FILES:
+        item = source / name
+        if item.is_file():
+            shutil.copy2(item, destination / name)
+    for pattern in PRESERVE_GLOBS:
+        for item in source.glob(pattern):
+            if item.is_file():
+                shutil.copy2(item, destination / item.name)
+    for name in PRESERVE_DIRECTORIES:
+        item = source / name
+        if item.is_dir():
+            shutil.copytree(item, destination / name, dirs_exist_ok=True)
+
+
+def _same_or_child(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def stop_target_processes(install_dir: Path) -> None:
+    targets: list[psutil.Process] = []
+    current_pid = os.getpid()
+    for process in psutil.process_iter(["pid", "name", "exe"]):
+        if process.info["pid"] == current_pid or (process.info.get("name") or "").casefold() != ENTRYPOINT.casefold():
+            continue
         try:
-            with open(self.changes_file_path, "r", encoding="utf-8") as f:
-                raw_changes = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise UpdateManifestError("无法读取更新清单") from exc
+            executable = process.info.get("exe") or process.exe()
+            if executable and _same_or_child(Path(executable), install_dir):
+                targets.append(process)
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            continue
 
-        if not isinstance(raw_changes, dict):
-            raise UpdateManifestError("更新清单必须是对象")
-
-        plan = {"deleted_dir": [], "deleted": [], "added_dir": [], "added": [], "modified": []}
-        for operation, entries in raw_changes.items():
-            if operation not in plan:
-                raise UpdateManifestError(f"更新清单包含未知操作: {operation}")
-            if not isinstance(entries, list):
-                raise UpdateManifestError(f"更新清单操作 {operation} 必须是路径列表")
-
-            for original_path in entries:
-                normalized_path = self._normalize_manifest_path(original_path)
-                target_path = self._resolve_path_within_root(self.cover_folder_path, normalized_path)
-                if operation in {"added", "modified"}:
-                    source_path = self._resolve_path_within_root(self.extract_folder_path, normalized_path)
-                    plan[operation].append((original_path, source_path, target_path))
-                else:
-                    plan[operation].append((original_path, target_path))
-
-        return plan
-
-    def validate_update_payload(self):
-        """在终止应用进程前验证增量更新清单及其所有目标路径。"""
-        self._incremental_update_plan = None
-        if not os.path.exists(self.changes_file_path):
-            return
-        self._incremental_update_plan = self._load_incremental_update_plan()
-
-    def _get_extracted_updater_path(self):
-        return os.path.join(self.extract_folder_path, self.updater_name)
-
-    def _get_staged_updater_path(self):
-        return os.path.join(self.temp_path, self.apply_updater_name)
-
-    def _prepare_update_payload(self, apply_mode):
-        while True:
-            if self.extract_file():
-                return
-
-    def _handoff_to_new_updater(self, current_executable=None):
-        if not self.file_name:
-            return False
-
-        extracted_updater_path = self._get_extracted_updater_path()
-        if not os.path.exists(extracted_updater_path):
-            return False
-
-        current_executable_path = os.path.abspath(current_executable or sys.argv[0])
-        staged_updater_path = self._get_staged_updater_path()
-
+    if not targets:
+        return
+    print(f"正在关闭当前目录中的 {len(targets)} 个 AALC 进程……")
+    for process in targets:
         try:
-            if os.path.abspath(extracted_updater_path) == current_executable_path:
-                return False
-
-            shutil.copy2(extracted_updater_path, staged_updater_path)
-            subprocess.Popen(
-                [staged_updater_path, "--apply-update", self.file_name],
-                creationflags=subprocess.DETACHED_PROCESS,
-                cwd=self.cover_folder_path,
-            )
-            print("已切换到新版本更新器继续更新...")
-            return True
-        except Exception as e:
-            print(f"切换到新版本更新器失败，将继续使用当前更新器: {e}")
-            return False
-
-    def terminate_processes(self):
-        """终止相关进程以准备更新。"""
-        print("开始终止进程...")
-        for proc in psutil.process_iter(attrs=["pid", "name"]):
-            if proc.info["name"] in self.process_names or any(name in proc.info["name"] for name in self.process_names):
-                try:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=10)  # 等待最多10秒
-                    except psutil.TimeoutExpired:
-                        proc.kill()  # 超时强制终止
-                        proc.wait(timeout=5)  # 再次等待
-                except psutil.AccessDenied:
-                    print(f"无权限终止进程 PID: {proc.info['pid']}")
-                except psutil.NoSuchProcess:
-                    print(f"进程 PID: {proc.info['pid']} 已退出")
-        print("终止进程完成")
-
-    def cleanup(self):
-        """清理下载和解压的临时文件。"""
-        print("开始清理...")
-        self._cleanup_file(self.download_file_path, "下载文件")
-        self._cleanup_tree(self.extract_folder_path, "提取目录")
-        self._cleanup_file(self.changes_file_path, "变更清单文件")
-        print("清理完成")
-
-    @staticmethod
-    def _cleanup_file(path, label):
-        if not path:
-            return
+            process.terminate()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            pass
+    _, alive = psutil.wait_procs(targets, timeout=10)
+    for process in alive:
         try:
-            os.remove(path)
-        except FileNotFoundError:
-            print(f"{label}不存在，跳过")
-        except Exception as e:
-            print(f"清理{label}失败: {e}")
+            process.kill()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            pass
+    _, alive = psutil.wait_procs(alive, timeout=5)
+    if alive:
+        raise UpdaterError("AALC 仍在运行，请手动关闭当前目录中的 AALC 后重试")
 
-    @staticmethod
-    def _cleanup_tree(path, label):
-        if not path:
-            return
+
+def transactional_install(
+    install_dir: Path,
+    payload_root: Path,
+    version: str,
+    *,
+    launch: bool = True,
+) -> Path:
+    install_dir = install_dir.resolve()
+    if not (install_dir / ENTRYPOINT).is_file():
+        raise UpdaterError(f"更新程序必须放在 AALC 目录内；当前目录缺少 {ENTRYPOINT}")
+    if install_dir.parent == install_dir:
+        raise UpdaterError("不能更新磁盘根目录")
+
+    suffix = time.strftime("%Y%m%d-%H%M%S")
+    staging = install_dir.parent / f".{install_dir.name}.update-staging-{uuid.uuid4().hex[:8]}"
+    backup = install_dir.parent / f"{install_dir.name}.backup-{suffix}"
+    if backup.exists():
+        backup = install_dir.parent / f"{backup.name}-{uuid.uuid4().hex[:4]}"
+
+    old_moved = False
+    new_installed = False
+    try:
+        print("正在准备新版本……")
+        shutil.copytree(payload_root, staging)
+        (staging / ".aalc-release.json").write_text(
+            json.dumps({"version": version, "repository": REPOSITORY}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        stop_target_processes(install_dir)
+        _copy_preserved_data(install_dir, staging)
+
+        print("正在切换版本……")
+        install_dir.rename(backup)
+        old_moved = True
+        staging.rename(install_dir)
+        new_installed = True
+    except Exception as exc:
+        if new_installed and install_dir.exists():
+            failed = install_dir.parent / f".{install_dir.name}.failed-{uuid.uuid4().hex[:8]}"
+            try:
+                install_dir.rename(failed)
+                shutil.rmtree(failed, ignore_errors=True)
+            except OSError:
+                pass
+        if old_moved and backup.exists() and not install_dir.exists():
+            try:
+                backup.rename(install_dir)
+            except OSError as rollback_exc:
+                raise UpdaterError(f"安装失败且自动回滚失败；旧版本位于 {backup}：{rollback_exc}") from exc
+        if isinstance(exc, UpdaterError):
+            raise
+        raise UpdaterError(f"安装失败，已恢复旧版本：{exc}") from exc
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+    print(f"更新完成：{version}")
+    print(f"旧版本备份：{backup}")
+    if launch:
+        subprocess.Popen([install_dir / ENTRYPOINT], cwd=install_dir)
+    return backup
+
+
+class StandaloneUpdater:
+    def __init__(self, install_dir: Path, api_url: str = LATEST_RELEASE_API):
+        self.install_dir = install_dir.resolve()
+        self.api_url = api_url
+
+    def _load_release(self) -> tuple[str, dict[str, ReleaseAsset], UpdateManifest]:
+        print(f"正在检查 {REPOSITORY} 的最新版本……")
+        tag, assets = parse_release(fetch_json(self.api_url))
+        manifest_asset = assets.get(MANIFEST_ASSET_NAME)
+        if manifest_asset is None:
+            raise UpdaterError(f"最新 Release 缺少 {MANIFEST_ASSET_NAME}")
+        manifest = UpdateManifest.from_json(fetch_json(manifest_asset.url), tag)
+        return tag, assets, manifest
+
+    def run(
+        self,
+        *,
+        source_archive: Path | None = None,
+        check_only: bool = False,
+        launch: bool = True,
+        force: bool = False,
+    ) -> Path | None:
+        tag, assets, manifest = self._load_release()
+        package_asset = assets.get(manifest.asset)
+        if package_asset is None:
+            raise UpdaterError(f"最新 Release 缺少 {manifest.asset}")
+        if manifest.size is not None and package_asset.size is not None and manifest.size != package_asset.size:
+            raise UpdaterError("Release 资产大小与更新清单不一致")
+        if check_only:
+            print(f"最新可用版本：{tag}")
+            return None
+        local_release = self.install_dir / ".aalc-release.json"
+        if not force and local_release.is_file():
+            try:
+                current_version = json.loads(local_release.read_text(encoding="utf-8")).get("version")
+            except (OSError, json.JSONDecodeError, AttributeError):
+                current_version = None
+            if current_version == tag:
+                print(f"当前已经是最新版本：{tag}")
+                return None
+
+        workspace = Path(tempfile.mkdtemp(prefix="AALC-update-payload-"))
         try:
-            shutil.rmtree(path)
-        except FileNotFoundError:
-            print(f"{label}不存在，跳过")
-        except Exception as e:
-            print(f"清理{label}失败: {e}")
+            package_path = workspace / manifest.asset
+            if source_archive is None:
+                print(f"正在下载 {manifest.asset}……")
+                download_file(package_asset.url, package_path, manifest.size or package_asset.size)
+            else:
+                print(f"正在验证已下载的更新包：{source_archive}")
+                shutil.copy2(source_archive, package_path)
+            actual_hash = sha256_file(package_path)
+            if actual_hash != manifest.sha256:
+                raise UpdaterError(f"更新包 SHA-256 校验失败：{actual_hash}")
+            print("SHA-256 校验通过")
 
-    def run(self, apply_mode=False):
-        """运行更新流程。"""
-        self._prepare_update_payload(apply_mode)
-        try:
-            self.validate_update_payload()
-        except UpdateManifestError as exc:
-            print(f"更新清单无效，已取消更新: {exc}")
-            return False
-        if not apply_mode and self._handoff_to_new_updater():
-            return
-        self.terminate_processes()
-        self.cover_folder()
-        self.cleanup()
-        input("已完成更新，按回车键退出并打开软件\nThe update is complete, press enter to exit and open the software")
-        if os.system(f'cmd /c start "" "{os.path.abspath("./AALC.exe")}"'):
-            subprocess.Popen(os.path.abspath("./AALC.exe"))
+            extracted = workspace / "extracted"
+            payload_root = extract_verified_zip(package_path, extracted, manifest)
+            return transactional_install(self.install_dir, payload_root, tag, launch=launch)
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
-def check_temp_dir_and_run():
-    """检查临时目录并运行更新程序。"""
+def _executable_path() -> Path:
+    return Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
+
+
+def _resolve_legacy_archive(install_dir: Path, value: str | None) -> Path | None:
+    if not value:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = install_dir / "update_temp" / candidate.name
+    candidate = candidate.resolve()
+    if not candidate.is_file():
+        raise UpdaterError(f"找不到已下载的更新包：{candidate}")
+    return candidate
+
+
+def relaunch_worker(args: argparse.Namespace, install_dir: Path, source_archive: Path | None) -> None:
     if not getattr(sys, "frozen", False):
-        print("更新程序只支持打包成exe后运行")
-        sys.exit(1)
+        raise UpdaterError("源码运行请使用 --no-relaunch；给普通电脑使用时请运行打包后的 EXE")
+    workspace = Path(tempfile.mkdtemp(prefix="AALC-updater-worker-"))
+    worker = workspace / "AALC 更新程序.exe"
+    shutil.copy2(_executable_path(), worker)
+    command = [str(worker), "--worker", "--install-dir", str(install_dir), "--api-url", args.api_url]
+    if source_archive is not None:
+        copied_archive = workspace / source_archive.name
+        shutil.copy2(source_archive, copied_archive)
+        command.extend(["--source-archive", str(copied_archive)])
+    if args.check_only:
+        command.append("--check-only")
+    if args.no_launch:
+        command.append("--no-launch")
+    if args.force:
+        command.append("--force")
+    subprocess.Popen(command, cwd=workspace, creationflags=CREATE_NEW_CONSOLE, close_fds=True)
 
-    temp_path = os.path.abspath("./update_temp")
-    file_path = sys.argv[0]
-    destination_path = os.path.join(temp_path, os.path.basename(file_path))
 
-    if file_path != destination_path:
-        if os.path.exists("./Update.exe"):
-            os.remove("./Update.exe")
-        os.makedirs(temp_path, exist_ok=True)
-        shutil.copy(file_path, destination_path)
-        args = [destination_path] + sys.argv[1:]
-        subprocess.Popen(args, creationflags=subprocess.DETACHED_PROCESS)
-        sys.exit(0)
+def _show_error(message: str) -> None:
+    print(f"\n更新失败：{message}")
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, "AALC 更新失败", 0x10)
+    except Exception:
+        pass
 
-    apply_mode = len(sys.argv) >= 3 and sys.argv[1] == "--apply-update"
-    if apply_mode:
-        file_name = sys.argv[2]
-    else:
-        file_name = sys.argv[1] if len(sys.argv) == 2 else None
 
-    updater = Updater(file_name)
-    updater.run(apply_mode=apply_mode)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="AALC Optimized 零配置更新程序")
+    parser.add_argument("legacy_archive", nargs="?", help=argparse.SUPPRESS)
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--install-dir", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--source-archive", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--api-url", default=LATEST_RELEASE_API, help=argparse.SUPPRESS)
+    parser.add_argument("--check-only", action="store_true", help="只检查最新版本")
+    parser.add_argument("--no-launch", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--no-relaunch", action="store_true", help=argparse.SUPPRESS)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    executable = _executable_path()
+    install_dir = (args.install_dir or executable.parent).resolve()
+    try:
+        source_archive = args.source_archive or _resolve_legacy_archive(install_dir, args.legacy_archive)
+        if not args.worker and not args.no_relaunch:
+            if not (install_dir / ENTRYPOINT).is_file():
+                raise UpdaterError(f"请把更新程序放入 AALC 文件夹后再双击；此处缺少 {ENTRYPOINT}")
+            relaunch_worker(args, install_dir, source_archive)
+            return 0
+        StandaloneUpdater(install_dir, args.api_url).run(
+            source_archive=source_archive,
+            check_only=args.check_only,
+            launch=not args.no_launch,
+            force=args.force,
+        )
+        return 0
+    except UpdaterError as exc:
+        _show_error(str(exc))
+        return 1
+    except Exception as exc:
+        _show_error(f"未预期错误：{exc}")
+        return 1
 
 
 if __name__ == "__main__":
-    check_temp_dir_and_run()
+    raise SystemExit(main())

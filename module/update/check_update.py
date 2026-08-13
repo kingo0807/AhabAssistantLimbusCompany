@@ -59,7 +59,8 @@ class UpdateThread(QThread):
         self.flag = flag  # 标志位，用于控制是否执行检查更新
         self.error_msg = ""  # 错误信息
 
-        self.user = "KIYI671"
+        # 优化版固定跟随用户自己的公开仓库，避免更新后退回上游未优化版本。
+        self.user = "kingo0807"
         self.repo = "AhabAssistantLimbusCompany"
         self.new_version = ""
         # 记录本次检查后“当前版本是否已追平最新版本”，供资源同步门禁读取。
@@ -130,43 +131,22 @@ class UpdateThread(QThread):
         检查是否有新版本，如果有则发送更新可用信号；否则发送成功信号。
         """
         try:
-            # 如果标志位为 False 且配置中的检查更新标志也为 False，则直接返回
             if self.flag and not cfg.get_value("check_update"):
                 return
 
-            # 第一步：优先从 Mirror酱 获取最新版本信息，并同步记录版本门禁需要的数据。
-            data = self.check_update_info_mirrorchyan()
-            version = data["version_name"]
-            # 同步记录本次检查得到的最新版本号与比较结果，供资源同步门禁直接复用。
+            # 优化版 Release 只发布在 kingo0807 的公开仓库。这里直接使用 GitHub，
+            # 否则 Mirror酱返回的上游版本号会掩盖优化版的新 Release。
+            data = self.check_update_info_github()
+            version = data["tag_name"]
             current_version, latest_version = self._set_version_gate_state(version)
-            # 第二步：整理更新日志正文，去掉图片，生成可展示文本。
-            content = self._build_release_note_content(data["release_note"])
-
-            # 第三步：比较当前版本与最新版本，并统一发出检查结果信号。
+            content = self._build_release_note_content(data.get("body") or "")
+            if self.get_download_url_from_assets(data.get("assets", [])) is None:
+                self.updateSignal.emit(UpdateStatus.SUCCESS)
+                return
             self._emit_version_check_result(version, current_version, latest_version, content)
         except Exception as e:
-            # Mirror酱 失败后自动回退到 GitHub，保持原有软件更新逻辑不变。
-            log.error(f"从Mirror酱源检查更新失败:{e},尝试使用GitHub源检查更新")
-            try:
-                data = self.check_update_info_github()
-                version = data["tag_name"]
-                # 当回退到 GitHub 源时，同样刷新版本比较结果，避免后续门禁读取到旧值。
-                current_version, latest_version = self._set_version_gate_state(version)
-                # 回退到 GitHub 后同样整理更新日志正文。
-                content = self._build_release_note_content(data["body"])
-                assets_url = self.get_download_url_from_assets(data["assets"])
-
-                # 若当前回退源未携带可下载资产，则按“当前无需更新”处理。
-                if assets_url is None:
-                    self.updateSignal.emit(UpdateStatus.SUCCESS)
-                    return
-
-                # 最后继续复用同一套版本比较逻辑，决定是否弹出更新提示。
-                self._emit_version_check_result(version, current_version, latest_version, content)
-            except Exception as e:
-                # 异常处理，发送失败信号
-                log.error(f"Mirror酱源与GitHub源均检查更新失败:{e}")
-                self.updateSignal.emit(UpdateStatus.FAILURE)
+            log.error(f"从优化版 GitHub 仓库检查更新失败:{e}")
+            self.updateSignal.emit(UpdateStatus.FAILURE)
 
     def check_update_info_github(self):
         """
@@ -242,6 +222,11 @@ class UpdateThread(QThread):
         返回:
         .7z 文件的下载 URL，如果没有找到则返回 None
         """
+        # 优化版优先下载带 SHA-256 清单的 ZIP，独立更新器会在安装前校验。
+        for asset in assets:
+            if asset["name"] == "AALC-Optimized-win64.zip":
+                return asset["browser_download_url"]
+        # 保留上游 .7z 兼容路径，便于同一模块继续复用。
         for asset in assets:
             if asset["name"].endswith(".7z"):
                 return asset["browser_download_url"]
@@ -249,6 +234,14 @@ class UpdateThread(QThread):
 
     def get_assets_url(self):
         try:
+            # 优化版不使用 Mirror酱的上游包，防止更新时覆盖掉本仓库优化。
+            if self.user == "kingo0807":
+                data = self.check_update_info_github()
+                assets_url = self.get_download_url_from_assets(data["assets"])
+                if assets_url is None:
+                    self.updateSignal.emit(UpdateStatus.SUCCESS)
+                    return None
+                return assets_url
             if cfg.update_source == "MirrorChyan":
                 if cfg.mirrorchyan_cdk == "":
                     self.error_msg = "未设置 Mirror酱 CDK"

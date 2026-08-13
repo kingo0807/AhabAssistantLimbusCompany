@@ -1,7 +1,11 @@
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import subprocess
+import zipfile
+from pathlib import Path
 
 import PyInstaller.__main__
 
@@ -92,5 +96,33 @@ for rel_path in redundant_files:
     else:
         print(f"Warning: {abs_path} not found.")
 
-# 压缩为7z文件
+# 压缩为7z文件，兼容上游应用内更新。
 subprocess.run(["7z", "a", "-mx=7", f"AALC_{version}.7z", "AALC/*"], cwd="./dist")
+
+# 生成优化版独立更新器使用的 ZIP、校验清单和单独 EXE 资产。
+package_path = Path("dist/AALC-Optimized-win64.zip")
+with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=7) as package:
+    for path in Path("dist/AALC").rglob("*"):
+        if path.is_file():
+            package.write(path, path.relative_to("dist").as_posix())
+
+digest = hashlib.sha256()
+with package_path.open("rb") as package_file:
+    while chunk := package_file.read(1024 * 1024):
+        digest.update(chunk)
+
+manifest = {
+    "schema_version": 1,
+    "version": version,
+    "asset": package_path.name,
+    "sha256": digest.hexdigest(),
+    "size": package_path.stat().st_size,
+    "entrypoint": "AALC.exe",
+    "archive_root": "AALC",
+    "min_updater_version": "1.0.0",
+}
+Path("dist/update-manifest.json").write_text(
+    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+shutil.copy2("dist/AALC/AALC Updater.exe", "dist/AALC-Update.exe")
