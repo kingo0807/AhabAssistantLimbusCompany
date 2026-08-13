@@ -1,5 +1,6 @@
 import re
 import time
+from enum import Enum
 from time import sleep
 
 from module.automation import auto
@@ -42,7 +43,41 @@ def to_log_with_time(msg, elapsed_time):
     log.info(f"{msg} 总耗时:{time_string}")
 
 
+class MirrorRunResult(Enum):
+    """一次镜牢调用的实际结果，避免把“到达奖励页”误当成完整通关。"""
+
+    COMPLETED = "completed"
+    RESUMED_COMPLETED = "resumed_completed"
+    INTENTIONAL_PARTIAL = "intentional_partial"
+    DEFEATED = "defeated"
+    CLAIMED_PREVIOUS_REWARD = "claimed_previous_reward"
+    FAILED = "failed"
+
+    @property
+    def counts_as_run(self) -> bool:
+        return self in {self.COMPLETED, self.INTENTIONAL_PARTIAL}
+
+    @property
+    def reached_safe_menu(self) -> bool:
+        return self in {
+            self.COMPLETED,
+            self.RESUMED_COMPLETED,
+            self.INTENTIONAL_PARTIAL,
+            self.CLAIMED_PREVIOUS_REWARD,
+        }
+
+    def __bool__(self) -> bool:
+        """兼容可能存在的旧调用方，同时保证战败/旧奖励不会被计数。"""
+        return self.counts_as_run
+
+
 class Mirror:
+    BATTLE_STATISTICS_THRESHOLD = 0.85
+    CLAIM_REWARDS_RESULT_THRESHOLD = 0.70
+    CLAIM_FORFEIT_THRESHOLD = 0.42
+    REWARD_LOADING_THRESHOLD = 0.85
+    REWARD_LOADING_TIMEOUT = 90.0
+
     def __init__(self, team_setting: TeamSetting, team_num: int):
         self.logger = log
         self.team_order = team_num
@@ -87,7 +122,7 @@ class Mirror:
 
         self.floor = 0
         self.get_floor_num = True
-        self.floor_times = [-9999.0 for i in range(5)]  # 负值代表缺失值
+        self.floor_times: list[float | None] = [None for _ in range(5)]
         self.LOOP_COUNT = 250
 
         self.mirror_map = MirrorMap(hard_mode=self.hard_switch)
@@ -95,6 +130,47 @@ class Mirror:
         self.pass_coins = None
 
         self.bequest_from_the_previous_game = False
+        self.resumed_run = False
+
+    def _record_floor_pack(self, floor_num: int, now: float | None = None) -> None:
+        """记录新楼层起点；断点续跑时只报告缺失，不构造虚假的超长耗时。"""
+        if not 0 <= floor_num < len(self.floor_times):
+            raise ValueError(f"楼层索引超出范围: {floor_num}")
+
+        now = time.monotonic() if now is None else now
+        if floor_num > 0:
+            previous_started_at = self.floor_times[floor_num - 1]
+            if previous_started_at is None:
+                if not any(started_at is not None for started_at in self.floor_times[:floor_num]):
+                    self.resumed_run = True
+                log.info(f"启动后第{floor_num}层卡包，该楼层开始时间缺失，无法统计耗时")
+            else:
+                to_log_with_time(f"启动后第{floor_num}层卡包", now - previous_started_at)
+        self.floor_times[floor_num] = now
+
+    def _log_last_floor_time(self, now: float | None = None) -> None:
+        """输出当前楼层耗时；无有效起点时跳过计算。"""
+        if not 1 <= self.floor <= len(self.floor_times):
+            log.info("楼层异常，可能是OCR识别错误，本轮镜牢层间的时间记录无效")
+            return
+
+        started_at = self.floor_times[self.floor - 1]
+        if started_at is None:
+            log.info(f"启动后第{self.floor}层卡包，该楼层开始时间缺失，无法统计耗时")
+            return
+        now = time.monotonic() if now is None else now
+        to_log_with_time(f"启动后第{self.floor}层卡包", now - started_at)
+
+    @staticmethod
+    def _parse_pass_coins(ocr_texts) -> int | None:
+        """解析通行证经验 OCR；兼容常见的 O/B/I/S 字符误识别。"""
+        translation = str.maketrans({"o": "0", "b": "8", "i": "1", "l": "1", "s": "5"})
+        text = "".join(str(value) for value in (ocr_texts or ())).lower().replace(" ", "")
+        normalized = text.translate(translation)
+        match = re.search(r"x(\d+)", normalized)
+        if match:
+            return int(match.group(1))
+        return None
 
     def _time_call(self, fn, *args, **kwargs):
         """调用 fn 并返回 (result, elapsed_time)，用于显式计时替代装饰器返回值。"""
@@ -111,6 +187,64 @@ class Mirror:
             defense_for_solo_state=self.defense_for_solo_state,
         )
         self.battle_total_time += elapsed
+
+    def _finish_battle_statistics(self) -> bool:
+        """识别位置发生偏移的战斗结算页，并进入对应奖励流程。"""
+        if not auto.find_element(
+            "mirror/claim_reward/battle_statistics_assets.png",
+            threshold=self.BATTLE_STATISTICS_THRESHOLD,
+            model="aggressive",
+        ):
+            return False
+
+        # 战败结算页的确认按钮与奖励按钮位置相近，但当前 UI 相似度只有
+        # 约 0.718。这里已有结算页特征作为前置门禁，可安全使用专用阈值。
+        if not auto.click_element(
+            "mirror/claim_reward/claim_rewards_assets.png",
+            threshold=self.CLAIM_REWARDS_RESULT_THRESHOLD,
+            model="aggressive",
+        ):
+            claim_rewards_bbox = ImageUtils.get_bbox(
+                ImageUtils.load_image("mirror/claim_reward/claim_rewards_assets.png")
+            )
+            auto.mouse_click(
+                (claim_rewards_bbox[0] + claim_rewards_bbox[2]) / 2,
+                (claim_rewards_bbox[1] + claim_rewards_bbox[3]) / 2,
+            )
+        return True
+
+    def _click_claim_forfeit(self) -> bool:
+        """等待并点击战败奖励页的放弃按钮，兼容当前 UI 的低对比度图标。"""
+        return bool(
+            auto.wait_for_element(
+                "mirror/claim_reward/claim_forfeit_assets.png",
+                timeout=1.5,
+                poll_interval=0.15,
+                click=True,
+                threshold=self.CLAIM_FORFEIT_THRESHOLD,
+                model="normal",
+            )
+        )
+
+    def _reward_loading_state(self, started_at: float | None) -> tuple[bool, float | None, bool]:
+        """识别奖励后的加载页，并返回加载起点与是否超时。"""
+        loading = auto.find_element(
+            "base/waiting_assets.png",
+            threshold=self.REWARD_LOADING_THRESHOLD,
+            model="normal",
+        ) or auto.find_element(
+            "base/waiting_2_assets.png",
+            threshold=self.REWARD_LOADING_THRESHOLD,
+            model="normal",
+        )
+        if not loading:
+            return False, None, False
+
+        now = time.monotonic()
+        if started_at is None:
+            started_at = now
+            log.debug("检测到镜牢奖励后的加载页，暂停奖励错误计数")
+        return True, started_at, now - started_at >= self.REWARD_LOADING_TIMEOUT
 
     def road_to_mir(self):
         loop_count = 30
@@ -136,6 +270,10 @@ class Mirror:
             if auto.find_element("mirror/road_in_mir/legend_assets.png"):
                 break
             if auto.click_element("mirror/road_to_mir/resume_assets.png"):
+                # 仅把“启动时接手已有进度”标为续跑；同一 Mirror 实例在异常恢复后
+                # 再次点击继续，已有本局楼层起点，仍应算作这次任务完成。
+                if not any(started_at is not None for started_at in self.floor_times):
+                    self.resumed_run = True
                 break
             if auto.click_element("mirror/road_to_mir/enter_mirror_assets.png", threshold=0.78):
                 break
@@ -219,15 +357,7 @@ class Mirror:
                     continue
 
             # 镜牢结束领取奖励
-            if auto.find_element("mirror/claim_reward/battle_statistics_assets.png"):
-                if auto.click_element("mirror/claim_reward/claim_rewards_assets.png") is False:
-                    claim_rewards_bbox = ImageUtils.get_bbox(
-                        ImageUtils.load_image("mirror/claim_reward/claim_rewards_assets.png")
-                    )
-                    auto.mouse_click(
-                        (claim_rewards_bbox[0] + claim_rewards_bbox[2]) / 2,
-                        (claim_rewards_bbox[1] + claim_rewards_bbox[3]) / 2,
-                    )
+            if self._finish_battle_statistics():
                 break
             if auto.find_element("mirror/claim_reward/claim_rewards_assets.png") and auto.find_element(
                 "mirror/claim_reward/complete_mirror_100%_assets.png"
@@ -252,16 +382,8 @@ class Mirror:
                     self.first_battle = True
                 try:
                     floor_num = self.floor  # 0,1,2,3,4
-                    if floor_num != 0:
-                        if self.floor_times[floor_num - 1] > 0:
-                            floor_time = time.time() - self.floor_times[floor_num - 1]
-                            msg = f"启动后第{self.floor}层卡包"
-                        else:
-                            floor_time = time.time() - self.floor_times[0]
-                            msg = f"启动后第{self.floor}层卡包，该楼层时间不完整"
-                        to_log_with_time(msg, floor_time)
-                    self.floor_times[floor_num] = time.time()
-                except:
+                    self._record_floor_pack(floor_num)
+                except (IndexError, TypeError, ValueError):
                     log.info("楼层异常，可能是OCR识别错误，本轮镜牢层间的时间记录无效")
                 self.get_floor_num = True
                 main_loop_count += 50
@@ -475,11 +597,13 @@ class Mirror:
 
         if self.bequest_from_the_previous_game:
             self.get_reward_in_road()
-            return True
+            return MirrorRunResult.CLAIMED_PREVIOUS_REWARD
 
         main_loop_count = 20
         auto.model = "clam"
         failed = None
+        completion_confirmed = False
+        reward_loading_started_at = None
         while True:
             # 自动截图
             if auto.take_screenshot() is None:
@@ -495,10 +619,26 @@ class Mirror:
                 "mirror/claim_reward/clear_assets.png"
             ):
                 failed = False
+                completion_confirmed = True
                 log.debug("镜牢完成度100%，能够正常领取奖励")
             # 如果回到主界面，退出循环
             if auto.find_element("home/drive_assets.png"):
                 break
+
+            is_loading, reward_loading_started_at, loading_timed_out = self._reward_loading_state(
+                reward_loading_started_at
+            )
+            if is_loading:
+                if loading_timed_out:
+                    if completion_confirmed:
+                        log.warning("镜牢奖励后加载超过90秒，完成状态已确认，先记录本局结果")
+                        break
+                    raise cannotOperateGameError("镜牢奖励后加载超时,请手动操作重试")
+                main_loop_count = 20
+                auto.model = "clam"
+                continue
+            reward_loading_started_at = None
+
             if auto.click_element("battle/battle_finish_confirm_assets.png"):
                 continue
             if auto.click_element("mirror/claim_reward/rewards_acquired_assets.png"):
@@ -520,8 +660,9 @@ class Mirror:
                     failed = False
                     continue
                 if auto.click_element("mirror/claim_reward/claim_rewards_assets.png"):
-                    sleep(1)
-                if auto.click_element("mirror/claim_reward/claim_forfeit_assets.png", model="normal", take_screenshot=True):
+                    if self._click_claim_forfeit():
+                        continue
+                elif self._click_claim_forfeit():
                     continue
             else:
                 if self.hard_switch and cfg.save_rewards:
@@ -563,21 +704,19 @@ class Mirror:
 
                     auto.take_screenshot()
                     coins_bbox = ImageUtils.get_bbox(ImageUtils.load_image("mirror/claim_reward/coins_bbox.png"))
-                    for _ in range(5):
-                        try:
-                            sc = ImageUtils.crop(auto.get_screenshot_array(), coins_bbox)
-                            result = ocr.run(sc)
-                            ocr_result = [result.txts[i] for i in range(len(result.txts))]
-                            ocr_result = "".join(ocr_result)
-                            ocr_result = ocr_result.lower()
-                            if "x" in ocr_result:
-                                ocr_result = ocr_result.split("x")
-                                self.pass_coins = int(ocr_result[-1])
-                                break
-                        except:
-                            continue
                     if self.pass_coins is None:
-                        for _ in range(5):
+                        for _ in range(2):
+                            try:
+                                sc = ImageUtils.crop(auto.get_screenshot_array(), coins_bbox)
+                                result = ocr.run(sc)
+                                parsed_coins = self._parse_pass_coins(result.txts)
+                                if parsed_coins is not None:
+                                    self.pass_coins = parsed_coins
+                                    break
+                            except (AttributeError, TypeError, ValueError):
+                                continue
+                    if self.pass_coins is None:
+                        for _ in range(2):
                             try:
                                 scale = cfg.set_win_size / 1440
                                 if coins_pos := auto.find_element("mirror/claim_reward/coins.png"):
@@ -589,14 +728,11 @@ class Mirror:
                                     ]
                                     sc = ImageUtils.crop(auto.get_screenshot_array(), coins_bbox)
                                     result = ocr.run(sc)
-                                    ocr_result = [result.txts[i] for i in range(len(result.txts))]
-                                    ocr_result = "".join(ocr_result)
-                                    ocr_result = ocr_result.lower()
-                                    if "x" in ocr_result:
-                                        ocr_result = ocr_result.split("x")
-                                        self.pass_coins = int(ocr_result[-1])
+                                    parsed_coins = self._parse_pass_coins(result.txts)
+                                    if parsed_coins is not None:
+                                        self.pass_coins = parsed_coins
                                         break
-                            except:
+                            except (AttributeError, TypeError, ValueError):
                                 continue
                     if self.pass_coins:
                         msg = f"本次镜牢领取{self.pass_coins}个通行证经验"
@@ -632,12 +768,12 @@ class Mirror:
                 raise cannotOperateGameError("镜牢奖励领取出错,请手动操作重试")
 
         if failed:
-            return False
+            return MirrorRunResult.DEFEATED
         # 计时结束
         end_time = time.time()
         elapsed_time = end_time - start_time
 
-        if all(self.floor_times[i] > 0 for i in range(5)):  # 判断是否完整走了五层
+        if all(started_at is not None for started_at in self.floor_times):  # 判断是否完整走了五层
             team = cfg.config.teams.get(f"{self.team_order}")
             if team:
                 team_history = {
@@ -689,12 +825,7 @@ class Mirror:
                 log.warning(f"无法找到编队{self.team_number}的历史记录，无法更新数据")
             log.debug(team_history)
 
-        try:
-            last_floor_time = time.time() - self.floor_times[self.floor - 1]
-            msg = f"启动后第{self.floor}层卡包"
-            to_log_with_time(msg, last_floor_time)
-        except:
-            log.info("楼层异常，可能是OCR识别错误，本轮镜牢层间的时间记录无效")
+        self._log_last_floor_time()
 
         # 输出战斗总时间
         msg = "此次镜牢在战斗"
@@ -724,7 +855,11 @@ class Mirror:
         msg = f"此次镜牢使用{self.system}体系队伍"
         to_log_with_time(msg, elapsed_time)
 
-        return True
+        if cfg.floor_3_exit:
+            return MirrorRunResult.INTENTIONAL_PARTIAL
+        if self.resumed_run:
+            return MirrorRunResult.RESUMED_COMPLETED
+        return MirrorRunResult.COMPLETED
 
     def enter_mir_with_star(self):
         coins = auto.find_element("mirror/road_to_mir/dreaming_star/coins_assets.png", threshold=0.9)
@@ -1044,7 +1179,11 @@ class Mirror:
                 loop_count -= 1
                 continue
 
-        time.sleep(3)
+        auto.wait_for_element(
+            "mirror/mybus_default_distance.png",
+            timeout=3.0,
+            poll_interval=0.15,
+        )
 
     @begin_and_finish_time_log(task_name="镜牢寻路")
     def search_road(self):
@@ -1054,11 +1193,17 @@ class Mirror:
             log.debug("简单键盘寻路失败，回退到常规寻路")
 
         try:
-            if next_node := self.mirror_map.get_next_step():
+            for route_attempt in range(2):
+                next_node = self.mirror_map.get_next_step()
                 if next_node is True:
                     return True
+                if not next_node:
+                    break
                 if self.mirror_map.enter_next_node(next_node):
                     return True
+                if route_attempt == 0:
+                    log.debug("规划节点未能进入，清空缓存并用当前地图重新规划一次")
+                    self.mirror_map.floor_map = []
             log.debug("未能构建路线图，尝试使用最近节点法重新寻路")
         except Exception as e:
             log.debug(f"使用onnx模型寻路出错:{e}")
@@ -1069,7 +1214,6 @@ class Mirror:
                 while auto.take_screenshot() is None:
                     continue
                 if search_road_default_distance():
-                    sleep(1)
                     return True
                 if auto.click_element("mirror/road_in_mir/enter_assets.png"):
                     return True
@@ -1081,7 +1225,6 @@ class Mirror:
                 while auto.take_screenshot() is None:
                     continue
                 if search_road_farthest_distance():
-                    sleep(1)
                     return True
                 if retry() is False:
                     return False
@@ -1238,8 +1381,12 @@ class Mirror:
             ):
                 auto.click_element("event/select_first_option_assets.png")
                 event_chance -= 1
-            if auto.find_element("event/perform_the_check_feature_assets.png"):
-                event_handling.decision_event_handling()
+            if auto.find_element(
+                "event/perform_the_check_feature_assets.png",
+                threshold=0.75,
+            ) and event_handling.decision_event_handling():
+                # 输入后立即刷新画面，避免继续在已失效的判定帧上匹配其它按钮。
+                continue
             if auto.click_element("event/continue_assets.png"):
                 continue
             if auto.click_element("event/proceed_assets.png"):
@@ -1286,8 +1433,12 @@ class Mirror:
             sleep(cfg.mouse_action_interval)
             auto.mouse_click(pos[0], pos[1] - 500 * my_scale)
             sleep(cfg.mouse_action_interval)
-            auto.click_element("mirror/road_in_mir/acquire_ego_gift_select_assets.png", model="normal")
-            time.sleep(2)
+            auto.wait_for_element(
+                "mirror/road_in_mir/acquire_ego_gift_select_assets.png",
+                timeout=1.5,
+                click=True,
+                model="normal",
+            )
             if retry() is False:
                 return False
             return
@@ -1324,11 +1475,12 @@ class Mirror:
                         gift_candidates.sort(key=lambda gift: gift[0])
                         button = gift_candidates[0][1]
                         auto.mouse_click(button[0], button[1])
-                        auto.click_element(
+                        auto.wait_for_element(
                             "mirror/road_in_mir/acquire_ego_gift_select_assets.png",
+                            timeout=1.5,
+                            click=True,
                             model="normal",
                         )
-                        time.sleep(2)
                         if retry() is False:
                             return False
                         return
@@ -1344,27 +1496,26 @@ class Mirror:
                             ocr_result = auto.find_language_text("白棉花", ["white", "gossypium"], bbox)
                             if isinstance(ocr_result, list):
                                 if len(ocr_result) >= 2:
-                                    time.sleep(1)
-                                    auto.click_element(
+                                    auto.wait_for_element(
                                         "mirror/road_in_mir/refuse_gift_assets.png",
-                                        take_screenshot=True,
+                                        timeout=1.5,
+                                        click=True,
                                     )
-                                    sleep(1)
-                                    auto.click_element(
+                                    auto.wait_for_element(
                                         "mirror/road_in_mir/refuse_gift_confirm_assets.png",
-                                        take_screenshot=True,
+                                        timeout=1.5,
+                                        click=True,
                                     )
-                                    time.sleep(2)
                                     if retry() is False:
                                         return False
                                     return
                         auto.mouse_click(button[0], button[1])
-                        time.sleep(1)
-                        auto.click_element(
+                        auto.wait_for_element(
                             "mirror/road_in_mir/acquire_ego_gift_select_assets.png",
+                            timeout=1.5,
+                            click=True,
                             model="normal",
                         )
-                        time.sleep(2)
                         if retry() is False:
                             return False
                         return
@@ -1420,11 +1571,12 @@ class Mirror:
                     for gift in my_list[:1]:
                         auto.mouse_click(gift[0], gift[1])
                         sleep(cfg.mouse_action_interval)
-                    auto.click_element(
+                    auto.wait_for_element(
                         "mirror/road_in_mir/acquire_ego_gift_select_assets.png",
+                        timeout=1.5,
+                        click=True,
                         model="normal",
                     )
-                    time.sleep(2)
                     if retry() is False:
                         return False
                     return
@@ -1432,11 +1584,12 @@ class Mirror:
                     for gift in my_list[:2]:
                         auto.mouse_click(gift[0], gift[1])
                         sleep(cfg.mouse_action_interval)
-                    auto.click_element(
+                    auto.wait_for_element(
                         "mirror/road_in_mir/acquire_ego_gift_select_assets.png",
+                        timeout=1.5,
+                        click=True,
                         model="normal",
                     )
-                    time.sleep(2)
                     if retry() is False:
                         return False
                     return
@@ -1444,11 +1597,12 @@ class Mirror:
                     for gift in my_list:
                         auto.mouse_click(gift[0], gift[1])
                         sleep(cfg.mouse_action_interval)
-                    auto.click_element(
+                    auto.wait_for_element(
                         "mirror/road_in_mir/acquire_ego_gift_select_assets.png",
+                        timeout=1.5,
+                        click=True,
                         model="normal",
                     )
-                    time.sleep(2)
                     if retry() is False:
                         return False
                     return
@@ -1460,10 +1614,26 @@ class Mirror:
     def get_reward_in_road(self):
         main_loop_count = 20
         auto.model = "clam"
+        reward_loading_started_at = None
         while True:
             if auto.take_screenshot() is None:
                 auto.mouse_to_blank()
                 continue
+            if auto.find_element("home/drive_assets.png"):
+                return True
+
+            is_loading, reward_loading_started_at, loading_timed_out = self._reward_loading_state(
+                reward_loading_started_at
+            )
+            if is_loading:
+                if loading_timed_out:
+                    log.warning("历史镜牢奖励后加载超过90秒，结束奖励等待")
+                    return True
+                main_loop_count = 20
+                auto.model = "clam"
+                continue
+            reward_loading_started_at = None
+
             # 如果回到主界面，退出循环
             if auto.click_element("mirror/claim_reward/rewards_acquired_assets.png"):
                 return True

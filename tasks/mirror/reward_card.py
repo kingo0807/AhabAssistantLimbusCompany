@@ -36,14 +36,17 @@ reward_card_model = {
     ],
 }
 
-_CLAIM_RETRY_DELAY = 5.0
+_CLAIM_RETRY_DELAY = 2.0
+_CLAIM_RESET_AFTER = 3
+_REWARD_CARD_TIMEOUT = 25.0
 
 
 @begin_and_finish_time_log(task_name="镜牢获取奖励卡", calculate_time=False)
 # 获取奖励卡
 def get_reward_card(model=0):
-    loop_count = 30
+    started_at = monotonic()
     claim_retry_at = 0.0
+    claim_attempts = 0
     state = "select_reward"
     auto.model = "clam"
     reward_card = reward_card_model[model]
@@ -60,9 +63,6 @@ def get_reward_card(model=0):
         if auto.find_element("mirror/road_in_mir/acquire_ego_gift_card.png"):
             log.debug("奖励卡领取后进入饰品选择，交回镜牢主循环处理")
             return True
-        if auto.click_element("mirror/get_reward_card/continue_choosing_assets.png", model="clam"):
-            state = "select_reward"
-            continue
 
         if state == "claim_reward":
             if confirm_position := auto.find_element(
@@ -72,6 +72,7 @@ def get_reward_card(model=0):
             ):
                 auto.mouse_click(confirm_position[0], confirm_position[1])
                 claim_retry_at = monotonic() + _CLAIM_RETRY_DELAY
+                claim_attempts = 1
                 state = "wait_result"
                 log.debug("已点击奖励卡领取按钮，等待页面切换")
                 continue
@@ -85,7 +86,18 @@ def get_reward_card(model=0):
                 if monotonic() >= claim_retry_at:
                     auto.mouse_click(confirm_position[0], confirm_position[1])
                     claim_retry_at = monotonic() + _CLAIM_RETRY_DELAY
+                    claim_attempts += 1
                     log.debug("奖励卡领取按钮仍在原位置，重新点击")
+                    continue
+                if claim_attempts >= _CLAIM_RESET_AFTER and auto.click_element(
+                    "mirror/get_reward_card/continue_choosing_assets.png",
+                    model="clam",
+                ):
+                    # 只在确认按钮连续重试失败后再取消选择。旧逻辑每帧优先点击 X，
+                    # 会把正常的确认等待误判为重选，720p 下因此反复循环。
+                    state = "select_reward"
+                    claim_attempts = 0
+                    log.warning("奖励卡确认多次未生效，取消当前选择后重试")
                     continue
 
         if state == "select_reward":
@@ -99,11 +111,11 @@ def get_reward_card(model=0):
                 continue
         if retry() is False:
             return False
-        loop_count -= 1
-        if loop_count < 20:
+        elapsed = monotonic() - started_at
+        if elapsed >= _REWARD_CARD_TIMEOUT * (1 / 3):
             auto.model = "normal"
-        if loop_count < 10:
+        if elapsed >= _REWARD_CARD_TIMEOUT * (2 / 3):
             auto.model = "aggressive"
-        if loop_count < 0:
+        if elapsed >= _REWARD_CARD_TIMEOUT:
             log.error("无法获取奖励卡")
             return False

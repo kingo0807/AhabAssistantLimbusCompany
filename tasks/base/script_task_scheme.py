@@ -42,7 +42,7 @@ from tasks.base.make_enkephalin_module import (
 from tasks.battle import battle
 from tasks.daily.get_prize import get_mail_prize, get_pass_prize
 from tasks.daily.luxcavation import EXP_luxcavation, thread_luxcavation
-from tasks.mirror.mirror import Mirror
+from tasks.mirror.mirror import Mirror, MirrorRunResult
 from tasks.teams.team_formation import select_battle_team
 from utils.path_manager import path_manager
 from utils.utils import calculate_the_teams, check_hard_mirror_time, get_day_of_week
@@ -93,17 +93,14 @@ def onetime_mir_process(team_setting: TeamSetting, team_num: int):
     # 进行一次镜牢
     try:
         mirror_adventure = Mirror(team_setting, team_num)
-        if mirror_adventure.run():
-            del mirror_adventure
-            mirror_adventure = None
+        mirror_result = mirror_adventure.run()
+        if mirror_result.reached_safe_menu:
             back_init_menu()
             make_enkephalin_module()
-            return True
-        else:
-            return False
+        return mirror_result
     except Exception as e:
         log.exception(f"镜牢行动出错: {e}")
-        return False
+        return MirrorRunResult.FAILED
 
 
 def to_get_reward():
@@ -333,7 +330,7 @@ def Mirror_task():
                 continue
         # 执行一次镜牢任务，根据执行结果进行处理
         mirror_result = onetime_mir_process(team_setting, team_num)
-        if mirror_result:
+        if mirror_result.counts_as_run:
             cfg.rotate_team_queue()
             mir_times -= 1
             if cfg.hard_mirror and cfg.auto_hard_mirror:
@@ -349,6 +346,10 @@ def Mirror_task():
             log.info(msg)
             if finish_times == 1 and cfg.re_claim_rewards:  # 完成第一次镜牢后重新领取奖励
                 to_get_reward()
+        elif mirror_result is MirrorRunResult.DEFEATED:
+            log.warning("本次镜牢战败，未计入完成次数，将使用当前队伍重试")
+        elif mirror_result is MirrorRunResult.CLAIMED_PREVIOUS_REWARD:
+            log.info("仅领取了历史镜牢奖励，未计入本次完成次数")
 
     mediator.mirror_bar_kill_signal.emit()
     if cfg.re_claim_rewards and finish_times > 1:
