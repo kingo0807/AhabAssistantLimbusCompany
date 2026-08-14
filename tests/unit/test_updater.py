@@ -10,6 +10,7 @@ from updater import (
     UpdateManifest,
     UpdaterError,
     extract_verified_zip,
+    launch_entrypoint,
     parse_release,
     relaunch_worker,
     resolve_install_dir,
@@ -96,6 +97,60 @@ def test_transactional_install_preserves_user_data_and_keeps_backup(tmp_path, mo
     assert (install / "config.yaml").read_text(encoding="utf-8") == "user: true"
     assert (install / "logs" / "debug.log").read_text(encoding="utf-8") == "evidence"
     assert (install / ".aalc-release.json").is_file()
+    assert (backup / ENTRYPOINT).read_bytes() == b"old"
+
+
+def test_launch_entrypoint_requests_uac_when_admin_is_required(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+    install.mkdir()
+    executable = install / ENTRYPOINT
+    executable.write_bytes(b"app")
+    shell_execute_args = {}
+
+    class ElevationRequired(OSError):
+        winerror = 740
+
+    def fake_shell_execute(*args):
+        shell_execute_args["args"] = args
+        return 42
+
+    monkeypatch.setattr("updater.subprocess.Popen", lambda *_args, **_kwargs: (_ for _ in ()).throw(ElevationRequired()))
+    monkeypatch.setattr("updater.ctypes.windll.shell32.ShellExecuteW", fake_shell_execute)
+
+    assert launch_entrypoint(install) is True
+    assert shell_execute_args["args"][1] == "runas"
+    assert shell_execute_args["args"][2] == str(executable)
+    assert shell_execute_args["args"][4] == str(install)
+
+
+def test_launch_entrypoint_keeps_successful_update_when_uac_is_cancelled(tmp_path, monkeypatch, capsys):
+    install = tmp_path / "AALC"
+    install.mkdir()
+    (install / ENTRYPOINT).write_bytes(b"app")
+
+    class ElevationRequired(OSError):
+        winerror = 740
+
+    monkeypatch.setattr("updater.subprocess.Popen", lambda *_args, **_kwargs: (_ for _ in ()).throw(ElevationRequired()))
+    monkeypatch.setattr("updater.ctypes.windll.shell32.ShellExecuteW", lambda *_args: 5)
+
+    assert launch_entrypoint(install) is False
+    assert "更新已完成，但未自动启动" in capsys.readouterr().out
+
+
+def test_transactional_install_does_not_fail_when_auto_launch_fails(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+    payload = tmp_path / "payload" / "AALC"
+    install.mkdir()
+    payload.mkdir(parents=True)
+    (install / ENTRYPOINT).write_bytes(b"old")
+    (payload / ENTRYPOINT).write_bytes(b"new")
+    monkeypatch.setattr("updater.stop_target_processes", lambda _install: None)
+    monkeypatch.setattr("updater.launch_entrypoint", lambda _install: False)
+
+    backup = transactional_install(install, payload, "v1.0.1")
+
+    assert (install / ENTRYPOINT).read_bytes() == b"new"
     assert (backup / ENTRYPOINT).read_bytes() == b"old"
 
 
