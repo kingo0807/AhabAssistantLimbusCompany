@@ -1,6 +1,8 @@
 import hashlib
 import zipfile
+from argparse import Namespace
 
+import psutil
 import pytest
 
 from updater import (
@@ -9,7 +11,11 @@ from updater import (
     UpdaterError,
     extract_verified_zip,
     parse_release,
+    relaunch_worker,
+    resolve_install_dir,
+    stop_target_processes,
     transactional_install,
+    wait_for_parent_exit,
 )
 
 
@@ -97,3 +103,139 @@ def test_manifest_digest_example_is_sha256():
     digest = hashlib.sha256(b"payload").hexdigest()
     manifest = _manifest(digest=digest)
     assert manifest.sha256 == digest
+
+
+def test_double_click_target_is_exactly_updater_folder(tmp_path):
+    first = tmp_path / "AALC-one"
+    second = tmp_path / "AALC-two"
+    first.mkdir()
+    second.mkdir()
+    executable = first / "AALC-Update.exe"
+    executable.touch()
+
+    args = Namespace(worker=False, install_dir=None)
+
+    assert resolve_install_dir(args, executable) == first.resolve()
+    assert resolve_install_dir(args, executable) != second.resolve()
+
+
+def test_external_install_dir_override_is_rejected(tmp_path):
+    executable = tmp_path / "AALC-one" / "AALC-Update.exe"
+    other = tmp_path / "AALC-two"
+
+    with pytest.raises(UpdaterError, match="不能从命令行指定"):
+        resolve_install_dir(Namespace(worker=False, install_dir=other), executable)
+
+
+def test_worker_keeps_original_folder_after_relaunch(tmp_path):
+    install = tmp_path / "AALC-one"
+    worker_executable = tmp_path / "system-temp" / "AALC 更新程序.exe"
+
+    assert resolve_install_dir(Namespace(worker=True, install_dir=install), worker_executable) == install.resolve()
+
+
+def test_relaunch_worker_passes_parent_pid_and_original_folder(tmp_path, monkeypatch):
+    install = tmp_path / "AALC-one"
+    install.mkdir()
+    executable = install / "AALC-Update.exe"
+    executable.write_bytes(b"updater")
+    workspace = tmp_path / "worker"
+    workspace.mkdir()
+    started = {}
+
+    monkeypatch.setattr("updater.sys.frozen", True, raising=False)
+    monkeypatch.setattr("updater._executable_path", lambda: executable)
+    monkeypatch.setattr("updater.tempfile.mkdtemp", lambda prefix: str(workspace))
+    monkeypatch.setattr("updater.os.getpid", lambda: 4321)
+
+    def fake_popen(command, **kwargs):
+        started["command"] = command
+        started["kwargs"] = kwargs
+
+    monkeypatch.setattr("updater.subprocess.Popen", fake_popen)
+    args = Namespace(
+        api_url="https://example.invalid/releases/latest",
+        check_only=False,
+        no_launch=False,
+        force=False,
+    )
+
+    relaunch_worker(args, install, None)
+
+    command = started["command"]
+    assert command[command.index("--parent-pid") + 1] == "4321"
+    assert command[command.index("--install-dir") + 1] == str(install)
+    assert started["kwargs"]["cwd"] == workspace
+
+
+def test_wait_for_parent_exit_waits_for_requested_process(monkeypatch):
+    waited = {}
+
+    class FakeParent:
+        def wait(self, timeout):
+            waited["timeout"] = timeout
+
+    def fake_process(pid):
+        waited["pid"] = pid
+        return FakeParent()
+
+    monkeypatch.setattr("updater.psutil.Process", fake_process)
+
+    wait_for_parent_exit(4321, timeout=3.0)
+
+    assert waited == {"pid": 4321, "timeout": 3.0}
+
+
+def test_wait_for_parent_exit_rejects_timeout(monkeypatch):
+    class SlowParent:
+        def wait(self, timeout):
+            raise psutil.TimeoutExpired(timeout, pid=4321)
+
+    monkeypatch.setattr("updater.psutil.Process", lambda _pid: SlowParent())
+
+    with pytest.raises(UpdaterError, match="旧更新程序未能退出"):
+        wait_for_parent_exit(4321, timeout=0.01)
+
+
+def test_transactional_install_does_not_touch_second_aalc(tmp_path, monkeypatch):
+    first = tmp_path / "AALC-one"
+    second = tmp_path / "AALC-two"
+    payload = tmp_path / "payload" / "AALC"
+    for install, marker in ((first, b"first-old"), (second, b"second-untouched")):
+        install.mkdir()
+        (install / ENTRYPOINT).write_bytes(marker)
+        (install / "config.yaml").write_text(marker.decode(), encoding="utf-8")
+    payload.mkdir(parents=True)
+    (payload / ENTRYPOINT).write_bytes(b"first-new")
+    monkeypatch.setattr("updater.stop_target_processes", lambda _install: None)
+
+    transactional_install(first, payload, "v1.0.0", launch=False)
+
+    assert (first / ENTRYPOINT).read_bytes() == b"first-new"
+    assert (second / ENTRYPOINT).read_bytes() == b"second-untouched"
+    assert (second / "config.yaml").read_text(encoding="utf-8") == "second-untouched"
+    assert not (second / ".aalc-release.json").exists()
+
+
+def test_stop_processes_only_targets_selected_folder(tmp_path, monkeypatch):
+    first = tmp_path / "AALC-one"
+    second = tmp_path / "AALC-two"
+
+    class FakeProcess:
+        def __init__(self, pid, executable):
+            self.info = {"pid": pid, "name": ENTRYPOINT, "exe": str(executable)}
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    selected = FakeProcess(1001, first / ENTRYPOINT)
+    untouched = FakeProcess(1002, second / ENTRYPOINT)
+    monkeypatch.setattr("updater.os.getpid", lambda: 999)
+    monkeypatch.setattr("updater.psutil.process_iter", lambda _attrs: [selected, untouched])
+    monkeypatch.setattr("updater.psutil.wait_procs", lambda processes, timeout: (processes, []))
+
+    stop_target_processes(first)
+
+    assert selected.terminated is True
+    assert untouched.terminated is False

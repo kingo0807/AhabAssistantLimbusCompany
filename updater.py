@@ -21,7 +21,7 @@ from typing import Any
 
 import psutil
 
-UPDATER_VERSION = "1.0.0"
+UPDATER_VERSION = "1.1.0"
 REPOSITORY = "kingo0807/AhabAssistantLimbusCompany"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 MANIFEST_ASSET_NAME = "update-manifest.json"
@@ -393,6 +393,17 @@ def _executable_path() -> Path:
     return Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
 
 
+def resolve_install_dir(args: argparse.Namespace, executable: Path) -> Path:
+    """双击模式只认更新器所在目录；目标参数仅供复制到临时目录后的内部进程使用。"""
+    if args.worker:
+        if args.install_dir is None:
+            raise UpdaterError("更新器内部进程缺少原始 AALC 目录")
+        return args.install_dir.resolve()
+    if args.install_dir is not None:
+        raise UpdaterError("不能从命令行指定更新目录；请把更新程序放进要更新的 AALC 文件夹")
+    return executable.parent.resolve()
+
+
 def _resolve_legacy_archive(install_dir: Path, value: str | None) -> Path | None:
     if not value:
         return None
@@ -411,7 +422,16 @@ def relaunch_worker(args: argparse.Namespace, install_dir: Path, source_archive:
     workspace = Path(tempfile.mkdtemp(prefix="AALC-updater-worker-"))
     worker = workspace / "AALC 更新程序.exe"
     shutil.copy2(_executable_path(), worker)
-    command = [str(worker), "--worker", "--install-dir", str(install_dir), "--api-url", args.api_url]
+    command = [
+        str(worker),
+        "--worker",
+        "--parent-pid",
+        str(os.getpid()),
+        "--install-dir",
+        str(install_dir),
+        "--api-url",
+        args.api_url,
+    ]
     if source_archive is not None:
         copied_archive = workspace / source_archive.name
         shutil.copy2(source_archive, copied_archive)
@@ -423,6 +443,18 @@ def relaunch_worker(args: argparse.Namespace, install_dir: Path, source_archive:
     if args.force:
         command.append("--force")
     subprocess.Popen(command, cwd=workspace, creationflags=CREATE_NEW_CONSOLE, close_fds=True)
+
+
+def wait_for_parent_exit(parent_pid: int | None, timeout: float = 15.0) -> None:
+    """等待安装目录中的原更新器退出，避免 Windows 文件占用导致目录切换失败。"""
+    if not parent_pid:
+        return
+    try:
+        psutil.Process(parent_pid).wait(timeout=timeout)
+    except psutil.NoSuchProcess:
+        return
+    except psutil.TimeoutExpired as exc:
+        raise UpdaterError("旧更新程序未能退出，请稍后重新运行更新") from exc
 
 
 def _show_error(message: str) -> None:
@@ -437,6 +469,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AALC Optimized 零配置更新程序")
     parser.add_argument("legacy_archive", nargs="?", help=argparse.SUPPRESS)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--install-dir", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--source-archive", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--api-url", default=LATEST_RELEASE_API, help=argparse.SUPPRESS)
@@ -450,14 +483,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     executable = _executable_path()
-    install_dir = (args.install_dir or executable.parent).resolve()
     try:
+        install_dir = resolve_install_dir(args, executable)
+        print(f"本次只更新此目录：{install_dir}")
         source_archive = args.source_archive or _resolve_legacy_archive(install_dir, args.legacy_archive)
         if not args.worker and not args.no_relaunch:
             if not (install_dir / ENTRYPOINT).is_file():
                 raise UpdaterError(f"请把更新程序放入 AALC 文件夹后再双击；此处缺少 {ENTRYPOINT}")
             relaunch_worker(args, install_dir, source_archive)
             return 0
+        wait_for_parent_exit(args.parent_pid)
         StandaloneUpdater(install_dir, args.api_url).run(
             source_archive=source_archive,
             check_only=args.check_only,
