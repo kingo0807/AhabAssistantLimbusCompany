@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -43,10 +44,15 @@ shutil.copytree("assets", os.path.join("dist", "AALC", "assets"), dirs_exist_ok=
 
 # 生成翻译文件
 os.makedirs(os.path.join("dist", "AALC", "i18n"), exist_ok=True)
+lrelease = Path(sys.executable).parent / "Scripts" / "pyside6-lrelease.exe"
+if not lrelease.is_file():
+    lrelease = Path(shutil.which("pyside6-lrelease") or "")
+if not lrelease.is_file():
+    raise FileNotFoundError("未找到 pyside6-lrelease，请在当前构建环境安装 PySide6")
 for ts_file in os.listdir("./i18n"):
     if ts_file.endswith(".ts"):
         qm_path = os.path.join("./i18n", ts_file.replace(".ts", ".qm"))
-        subprocess.run(["pyside6-lrelease", os.path.join("./i18n", ts_file), "-qm", qm_path])
+        subprocess.run([lrelease, os.path.join("./i18n", ts_file), "-qm", qm_path], check=True)
         print(f"Generated: {qm_path}")
         shutil.move(qm_path, os.path.join("dist", "AALC", "i18n", ts_file.replace(".ts", ".qm")))
 
@@ -96,8 +102,17 @@ for rel_path in redundant_files:
     else:
         print(f"Warning: {abs_path} not found.")
 
-# 压缩为7z文件，兼容上游应用内更新。
-subprocess.run(["7z", "a", "-mx=7", f"AALC_{version}.7z", "AALC/*"], cwd="./dist")
+# 若构建机提供 7z，则额外生成上游兼容包；优化版独立更新使用下方 ZIP，
+# 因此缺少 7z 不应让整个正式构建失败。
+seven_zip = shutil.which("7z")
+if seven_zip:
+    subprocess.run(
+        [seven_zip, "a", "-mx=7", f"AALC_{version}.7z", "AALC/*"],
+        cwd="./dist",
+        check=True,
+    )
+else:
+    print("Warning: 7z not found, skipping legacy .7z package.")
 
 # 生成优化版独立更新器使用的 ZIP、校验清单和单独 EXE 资产。
 package_path = Path("dist/AALC-Optimized-win64.zip")
