@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -233,7 +234,9 @@ class MumuControl(AbstractInput):
 
         self.lib = None
         self._ev = asyncio.new_event_loop()
+        self._ev_lock = threading.RLock()
         self._screenshot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="AALC-MuMuCapture")
+        self._screenshot_state_lock = threading.Lock()
         self._pending_screenshot = None
         self.display_id = display_id
 
@@ -777,22 +780,25 @@ class MumuControl(AbstractInput):
             NemuIpcIncompatible:
             NemuIpcError
         """
-        result = self._ev.run_until_complete(self.ev_run_async(func, *args, **kwargs))
+        # MuMu 截图和输入共用同一个 asyncio 事件循环。重试监控会从后台线程截图，
+        # 因此必须在最底层串行化所有 NemuIpc 调用，避免并发 run_until_complete。
+        with self._ev_lock:
+            result = self._ev.run_until_complete(self.ev_run_async(func, *args, **kwargs))
 
-        err = False
-        if func.__name__ == "nemu_connect":
-            if result == 0:
-                err = True
-        else:
-            if result > 0:
-                err = True
-        # Get to actual error message printed in std
-        if err:
-            log.warning(f"调用 {func.__name__} 失败，结果={result}")
-            with CaptureNemuIpc(log):
-                result = self._ev.run_until_complete(self.ev_run_async(func, *args, **kwargs))
+            err = False
+            if func.__name__ == "nemu_connect":
+                if result == 0:
+                    err = True
+            else:
+                if result > 0:
+                    err = True
+            # Get to actual error message printed in std
+            if err:
+                log.warning(f"调用 {func.__name__} 失败，结果={result}")
+                with CaptureNemuIpc(log):
+                    result = self._ev.run_until_complete(self.ev_run_async(func, *args, **kwargs))
 
-        return result
+            return result
 
     def get_resolution(self):
         """
@@ -837,7 +843,7 @@ class MumuControl(AbstractInput):
         return executor
 
     def _capture_display(self):
-        """在专用单线程执行器内完成一次原生截图，避免超时重试并发访问 DLL。"""
+        """在专用单线程执行器内完成一次原生截图，并与其他 NemuIpc 调用串行。"""
         width = self.width
         height = self.height
         width_ptr = ctypes.pointer(ctypes.c_int(width))
@@ -845,14 +851,17 @@ class MumuControl(AbstractInput):
         length = width * height * 4
         pixels_pointer = ctypes.pointer((ctypes.c_ubyte * length)())
 
-        ret = self.lib.nemu_capture_display(
-            self.connect_id,
-            self.display_id,
-            length,
-            width_ptr,
-            height_ptr,
-            pixels_pointer,
-        )
+        # wait_for 超时不会停止正在执行的 ctypes 调用；工作线程必须在调用结束前
+        # 持有全局 IPC 锁，避免截图与输入操作同时进入 MuMu DLL。
+        with self._ev_lock:
+            ret = self.lib.nemu_capture_display(
+                self.connect_id,
+                self.display_id,
+                length,
+                width_ptr,
+                height_ptr,
+                pixels_pointer,
+            )
         if ret > 0:
             raise NemuIpcError("nemu_capture_display failed during screenshot()")
 
@@ -873,10 +882,11 @@ class MumuControl(AbstractInput):
         if self.height == 0:
             self.get_resolution()
 
-        future = getattr(self, "_pending_screenshot", None)
-        if future is None:
-            future = self._get_screenshot_executor().submit(self._capture_display)
-            self._pending_screenshot = future
+        with self._screenshot_state_lock:
+            future = self._pending_screenshot
+            if future is None:
+                future = self._get_screenshot_executor().submit(self._capture_display)
+                self._pending_screenshot = future
 
         timeout = max(0.0, float(timeout))
         try:
@@ -885,10 +895,14 @@ class MumuControl(AbstractInput):
             # 不取消：运行中的 ctypes 调用无法安全终止。下一轮继续等待并复用其有效结果。
             raise TimeoutError(f"MuMu截图超过 {timeout:.2f}s，等待同一个 IPC 调用完成") from exc
         except Exception:
-            self._pending_screenshot = None
+            with self._screenshot_state_lock:
+                if self._pending_screenshot is future:
+                    self._pending_screenshot = None
             raise
         else:
-            self._pending_screenshot = None
+            with self._screenshot_state_lock:
+                if self._pending_screenshot is future:
+                    self._pending_screenshot = None
             return image
 
     def down(self, x, y):
