@@ -21,7 +21,7 @@ from typing import Any
 
 import psutil
 
-UPDATER_VERSION = "1.1.0"
+UPDATER_VERSION = "1.2.0"
 REPOSITORY = "kingo0807/AhabAssistantLimbusCompany"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 MANIFEST_ASSET_NAME = "update-manifest.json"
@@ -33,6 +33,9 @@ PRESERVE_GLOBS = ("config.yaml.*",)
 PRESERVE_DIRECTORIES = ("config_backup", "logs", "pythonlogs", "theme_pack_weight")
 CREATE_NEW_CONSOLE = 0x00000010
 CREATE_NO_WINDOW = 0x08000000
+ERROR_ELEVATION_REQUIRED = 740
+SHELL_EXECUTE_SUCCESS = 32
+SW_SHOWNORMAL = 1
 
 
 class UpdaterError(RuntimeError):
@@ -264,6 +267,37 @@ def stop_target_processes(install_dir: Path) -> None:
         raise UpdaterError("AALC 仍在运行，请手动关闭当前目录中的 AALC 后重试")
 
 
+def launch_entrypoint(install_dir: Path) -> bool:
+    """启动更新后的 AALC；需要管理员权限时改用 ShellExecute 请求 UAC。"""
+    executable = install_dir / ENTRYPOINT
+    try:
+        subprocess.Popen([executable], cwd=install_dir)
+        return True
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != ERROR_ELEVATION_REQUIRED:
+            print(f"更新已完成，但未能自动启动 AALC，请手动运行 {ENTRYPOINT}：{exc}")
+            return False
+
+    print("AALC 需要管理员权限，正在请求 UAC 授权……")
+    try:
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "runas",
+            str(executable),
+            None,
+            str(install_dir),
+            SW_SHOWNORMAL,
+        )
+        if result <= SHELL_EXECUTE_SUCCESS:
+            print(f"更新已完成，但未自动启动 AALC，请手动运行 {ENTRYPOINT}（系统返回值：{result}）")
+            return False
+        return True
+    except Exception as exc:
+        # 安装事务已经提交，UAC 被取消或启动 API 异常都不应再把更新判为失败。
+        print(f"更新已完成，但未自动启动 AALC，请手动运行 {ENTRYPOINT}：{exc}")
+        return False
+
+
 def transactional_install(
     install_dir: Path,
     payload_root: Path,
@@ -323,7 +357,7 @@ def transactional_install(
     print(f"更新完成：{version}")
     print(f"旧版本备份：{backup}")
     if launch:
-        subprocess.Popen([install_dir / ENTRYPOINT], cwd=install_dir)
+        launch_entrypoint(install_dir)
     return backup
 
 
