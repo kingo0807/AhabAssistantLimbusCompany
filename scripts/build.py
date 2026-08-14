@@ -34,8 +34,11 @@ PyInstaller.__main__.run(
     ]
 )
 
-# 移动更新程序到主程序目录
-shutil.move(os.path.join("dist", "AALC Updater.exe"), os.path.join("dist", "AALC"))
+# 移动更新程序到主程序目录，并保留独立发布资产使用的固定文件名。
+# 两个入口内容相同，避免更新后用户原有的 AALC-Update.exe 入口消失。
+bundled_updater = Path("dist/AALC/AALC Updater.exe")
+shutil.move("dist/AALC Updater.exe", bundled_updater)
+shutil.copy2(bundled_updater, bundled_updater.with_name("AALC-Update.exe"))
 
 # 拷贝必要的文件到dist目录
 shutil.copy("README.md", os.path.join("dist", "AALC", "README.md"))
