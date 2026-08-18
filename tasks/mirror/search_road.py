@@ -344,10 +344,6 @@ def search_road_from_road_map(hard_mode=False):
     road = []
     bus = None
 
-    if auto.click_element("mirror/mybus_default_distance.png", take_screenshot=True):
-        if MirrorMap._wait_and_enter_node():
-            return True, True
-
     if bus_position := auto.find_element("mirror/mybus_default_distance.png", take_screenshot=True):
         from tasks.base.retry import check_times
 
@@ -564,13 +560,15 @@ def divide_the_area_by_x(data):
 
 
 all_node_weight = {
-    "battle": 4,
+    # 最新五局实测：普通战斗平均 60.00 秒，事件平均 7.88 秒。
+    # 保守提高所有可选战斗的成本，同时保留原有战斗强度差，优先走耗时更短的事件路线。
+    "battle": 6,
     "boss_battle": 6,
     "event": 1,
-    "focused_encounter": 6,
-    "risky_encounter": 7,
+    "focused_encounter": 8,
+    "risky_encounter": 9,
     "shop": 2,
-    "abnormality_focused_encounter": 6,
+    "abnormality_focused_encounter": 8,
 }
 
 DEFAULT_WEIGHT = 999  # 默认不可达权重

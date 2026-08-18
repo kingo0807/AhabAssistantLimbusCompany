@@ -1,4 +1,13 @@
-from tasks.mirror.search_road import Position, RouteGraph
+from tasks.mirror.search_road import Position, RouteGraph, all_node_weight
+
+
+def test_route_weights_are_time_oriented_and_preserve_battle_severity() -> None:
+    assert all_node_weight["event"] == 1
+    assert all_node_weight["shop"] == 2
+    assert all_node_weight["battle"] == 6
+    assert all_node_weight["focused_encounter"] == 8
+    assert all_node_weight["abnormality_focused_encounter"] == 8
+    assert all_node_weight["risky_encounter"] == 9
 
 
 def test_road_x_mapping_connects_the_actual_later_layers() -> None:

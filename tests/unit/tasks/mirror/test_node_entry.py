@@ -97,3 +97,17 @@ def test_candidate_positions_use_fast_fresh_frames_and_preferred_direction_first
         ("D", (1079.0, 733.5)),
     ]
     assert fake_auto.screenshot_intervals == [0.15, 0.15]
+
+
+def test_fresh_map_planning_does_not_click_bus_and_wait_before_detection(monkeypatch):
+    class _FreshPlanningAuto:
+        def click_element(self, *_args, **_kwargs):
+            raise AssertionError("完整地图规划前不应点击当前巴士")
+
+        def find_element(self, path, **_kwargs):
+            assert path == "mirror/mybus_default_distance.png"
+            return None
+
+    monkeypatch.setattr(search_road, "auto", _FreshPlanningAuto())
+
+    assert search_road.search_road_from_road_map() == ([], [])
