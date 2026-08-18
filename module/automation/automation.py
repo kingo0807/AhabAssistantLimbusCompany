@@ -799,6 +799,10 @@ class Automation(metaclass=SingletonMeta):
 
         return ocr_text_list
 
+    def get_text_positions_from_screenshot(self, my_crop=None):
+        """返回当前帧中的 OCR 文本及坐标，并复用同帧 OCR 缓存。"""
+        return self._run_ocr_for_text(my_crop=my_crop)
+
     def _prepare_feature_target(self, pic_crop=None):
         """将目标区域统一到 1440p 模板坐标，并只提取一次特征。"""
         normalize_scale = 1440 / cfg.set_win_size

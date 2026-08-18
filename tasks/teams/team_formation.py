@@ -1,3 +1,4 @@
+import re
 from time import sleep
 
 from module.automation import auto
@@ -12,6 +13,11 @@ TEAM_LIST_RESET_BOTTOM_MARGIN = 60
 ORDERED_TEAM_PAGE_SIZE = 5
 ORDERED_TEAM_COUNT = 20
 ORDERED_TEAM_VISIBLE_ROWS = 6
+ORDERED_TEAM_NAME_PATTERN = re.compile(
+    r"^\s*(?:编队|TEAMS?|TFAMS?)\s*#?\s*(\d{1,2})\s*$",
+    re.IGNORECASE,
+)
+SINNER_COUNT_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\s*[/／]\s*(\d{1,2})(?!\d)")
 
 
 # 清队
@@ -80,6 +86,26 @@ def _ordered_team_location(num):
     return page_count, num - visible_page_start
 
 
+def _find_visible_ordered_team(num, position_bbox):
+    """精确识别当前可见的默认编号队伍；不确定时返回 None 走原复位流程。"""
+    for text, position in auto.get_text_positions_from_screenshot(position_bbox).items():
+        match = ORDERED_TEAM_NAME_PATTERN.fullmatch(text)
+        if match and int(match.group(1)) == num:
+            return position
+    return None
+
+
+def _reset_team_list(my_position, scale):
+    reset_distance = _team_list_reset_swipe_distance(
+        my_position[1], cfg.set_win_size, scale
+    )
+    for _ in range(3):
+        auto.mouse_swipe_for_scroll(
+            my_position[0], my_position[1], dy=reset_distance, duration=0.3
+        )
+    sleep(0.75)
+
+
 @begin_and_finish_time_log(task_name="寻找队伍")
 # 找队
 def select_battle_team(num):
@@ -99,16 +125,19 @@ def select_battle_team(num):
         my_position[1] += position[1]
         auto.mouse_click(my_position[0], my_position[1])
         sleep(0.5)
-        reset_distance = _team_list_reset_swipe_distance(
-            my_position[1], cfg.set_win_size, scale
-        )
-        for _ in range(3):
-            auto.mouse_swipe_for_scroll(
-                my_position[0], my_position[1], dy=reset_distance, duration=0.3
-            )
-        sleep(0.75)
         first_position = [position[0], position[1] + 70 * scale]
+        position_bbox = (0, 0, position[0] + 130 * scale, position[1] + 600 * scale)
         if cfg.select_team_by_order:
+            while auto.take_screenshot() is None:
+                continue
+            if visible_team_position := _find_visible_ordered_team(num, position_bbox):
+                auto.mouse_action_with_pos(visible_team_position, offset=False)
+                log.info(f"当前列表直接找到队伍 # {num}")
+                sleep(1)
+                return True
+
+            log.debug("当前可见区域未可靠识别到目标队伍，回退到完整列表复位")
+            _reset_team_list(my_position, scale)
             team_range, team_order = _ordered_team_location(num)
             ordered_page_distance = _ordered_team_page_swipe_distance()
             for _ in range(team_range):
@@ -126,9 +155,9 @@ def select_battle_team(num):
             sleep(1)
             return True
         else:
+            _reset_team_list(my_position, scale)
             team_name_zh = "编队#" + str(num)
             team_name_en = [f"TEAMS #{num}", f"TEAMS#{num}", f"TFAMS#{num}"]
-            position_bbox = (0, 0, position[0] + 130 * scale, position[1] + 600 * scale)
             for i in range(10):
                 while auto.take_screenshot() is None:
                     continue
@@ -230,14 +259,34 @@ def deal_with_spills():
         pass
 
 
+def _parse_available_sinner_count(ocr_texts) -> int | None:
+    """从“参战人数 n/m”一类 OCR 文本中提取仍可参战人数。"""
+    if isinstance(ocr_texts, dict):
+        ocr_texts = ocr_texts.keys()
+
+    candidates: list[tuple[int, int]] = []
+    for value in ocr_texts or ():
+        text = str(value).replace(" ", "")
+        for match in SINNER_COUNT_PATTERN.finditer(text):
+            available, total = (int(part) for part in match.groups())
+            if 5 <= total <= 12 and 0 <= available <= total:
+                candidates.append((total, available))
+
+    if not candidates:
+        return None
+    # 全屏中若存在其他进度比例，优先采用分母最大的队伍人数比例。
+    return max(candidates)[1]
+
+
 @begin_and_finish_time_log(task_name="检查队伍剩余战斗力")
-def check_team():
-    # 至少还有5人可以战斗
-    sinner_nums = [f"{a}/{b}" for b in range(5, 10) for a in range(5, b + 1)]
-    if auto.find_element(sinner_nums, find_type="text"):
-        return True
-    else:
-        return False
+def check_team() -> bool | None:
+    """返回队伍是否至少有 5 人；OCR 不确定时返回 None，禁止误放弃。"""
+    available = _parse_available_sinner_count(auto.get_text_positions_from_screenshot())
+    if available is None:
+        log.warning("无法可靠识别参战人数，本帧不执行镜牢放弃")
+        return None
+    log.debug(f"可靠识别到可参战人数: {available}")
+    return available >= 5
 
 
 @begin_and_finish_time_log(task_name="加载编队码")
