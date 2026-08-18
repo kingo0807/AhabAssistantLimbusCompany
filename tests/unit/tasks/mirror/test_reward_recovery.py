@@ -141,3 +141,29 @@ def test_reward_loading_accepts_second_asset_and_resets_when_absent(monkeypatch)
 
     fake_auto.visible_asset = None
     assert _handler()._reward_loading_state(20.0) == (False, None, False)
+
+
+def test_reward_progress_watchdog_only_resets_when_stage_changes(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(mirror_module.time, "monotonic", lambda: now)
+    handler = _handler()
+
+    started_at, stage, timed_out = handler._reward_progress_state(
+        None, None, "claim-rewards-confirm"
+    )
+    assert (started_at, stage, timed_out) == (100.0, "claim-rewards-confirm", False)
+
+    now = 129.9
+    assert handler._reward_progress_state(
+        started_at, stage, "claim-rewards-confirm"
+    ) == (100.0, "claim-rewards-confirm", False)
+
+    now = 130.0
+    assert handler._reward_progress_state(
+        started_at, stage, "claim-rewards-confirm"
+    ) == (100.0, "claim-rewards-confirm", True)
+
+    now = 140.0
+    assert handler._reward_progress_state(
+        started_at, stage, "rewards-acquired"
+    ) == (140.0, "rewards-acquired", False)

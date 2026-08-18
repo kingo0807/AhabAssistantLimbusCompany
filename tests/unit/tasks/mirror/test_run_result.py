@@ -88,3 +88,132 @@ def test_search_road_replans_locally_before_expensive_fallback(monkeypatch):
     assert handler.search_road() is True
     assert handler.mirror_map.entered == ["U", "D"]
     assert handler.mirror_map.floor_map == []
+
+
+class _FloorMap:
+    def __init__(self):
+        self.refreshed = []
+
+    def refresh_floor(self, floor):
+        self.refreshed.append(floor)
+
+
+class _FloorAuto:
+    def __init__(self, *, settings_opened=True, settings_ready=True, remaining_floors=3):
+        self.settings_opened = settings_opened
+        self.settings_ready = settings_ready
+        self.settings_is_open = False
+        self.remaining_floors = remaining_floors
+        self.closed_at = None
+
+    def click_element(self, path, **_kwargs):
+        assert path == "mirror/road_in_mir/setting_assets.png"
+        if self.settings_opened:
+            self.settings_is_open = True
+        return self.settings_opened
+
+    def wait_for_element(self, path, **_kwargs):
+        assert path == "mirror/road_in_mir/to_window_assets.png"
+        return (1000, 500) if self.settings_is_open and self.settings_ready else False
+
+    def find_element(self, path, **_kwargs):
+        if path == "mirror/road_in_mir/to_window_assets.png":
+            return (1000, 500) if self.settings_is_open and self.settings_ready else False
+        if path == "mirror/road_in_mir/not_passed_floor.png":
+            return [(index, 0) for index in range(self.remaining_floors)]
+        raise AssertionError(path)
+
+    def mouse_action_with_pos(self, position):
+        self.closed_at = position
+        return True
+
+
+def test_floor_recognition_success_refreshes_once_and_unlocks_pathfinding(monkeypatch):
+    handler = _handler()
+    handler.floor = 1
+    handler.get_floor_num = True
+    handler.mirror_map = _FloorMap()
+    fake_auto = _FloorAuto(remaining_floors=3)
+    monkeypatch.setattr(mirror_module, "auto", fake_auto)
+    monkeypatch.setattr(mirror_module.cfg, "set_win_size", 1440)
+
+    assert handler.get_which_floor() is True
+    assert handler.floor == 2
+    assert handler.get_floor_num is False
+    assert handler.mirror_map.refreshed == [2]
+    assert fake_auto.closed_at == (800, 500)
+
+
+def test_floor_recognition_failure_preserves_route_cache_and_retry_flag(monkeypatch):
+    handler = _handler()
+    handler.floor = 1
+    handler.get_floor_num = True
+    handler.mirror_map = _FloorMap()
+    monkeypatch.setattr(mirror_module, "auto", _FloorAuto(settings_ready=False))
+
+    assert handler.get_which_floor() is False
+    assert handler.floor == 1
+    assert handler.get_floor_num is True
+    assert handler.mirror_map.refreshed == []
+
+
+def test_floor_recognition_reuses_settings_page_that_finished_loading_late(monkeypatch):
+    handler = _handler()
+    handler.floor = 1
+    handler.get_floor_num = True
+    handler.mirror_map = _FloorMap()
+    fake_auto = _FloorAuto(settings_ready=False, remaining_floors=3)
+    monkeypatch.setattr(mirror_module, "auto", fake_auto)
+    monkeypatch.setattr(mirror_module.cfg, "set_win_size", 1440)
+
+    assert handler.get_which_floor() is False
+    fake_auto.settings_ready = True
+    fake_auto.settings_opened = False  # 弹窗打开后底层的设置按钮已不可点击
+
+    assert handler.get_which_floor() is True
+    assert handler.floor == 2
+    assert handler.mirror_map.refreshed == [2]
+
+
+def test_floor_recognition_rejects_transient_multi_floor_jump(monkeypatch):
+    handler = _handler()
+    handler.floor = 1
+    handler.get_floor_num = True
+    handler.mirror_map = _FloorMap()
+    monkeypatch.setattr(mirror_module, "auto", _FloorAuto(remaining_floors=0))
+    monkeypatch.setattr(mirror_module.cfg, "set_win_size", 1440)
+
+    assert handler.get_which_floor() is False
+    assert handler.floor == 1
+    assert handler.get_floor_num is True
+    assert handler.mirror_map.refreshed == []
+
+
+def test_floor_recognition_uses_sequential_floor_after_two_empty_template_reads(monkeypatch):
+    handler = _handler()
+    handler.floor = 1
+    handler.floor_times[0] = 100.0
+    handler.get_floor_num = True
+    handler.mirror_map = _FloorMap()
+    fake_auto = _FloorAuto(remaining_floors=0)
+    monkeypatch.setattr(mirror_module, "auto", fake_auto)
+    monkeypatch.setattr(mirror_module.cfg, "set_win_size", 1440)
+
+    assert handler.get_which_floor() is False
+    assert handler.get_which_floor() is True
+    assert handler.floor == 2
+    assert handler.get_floor_num is False
+    assert handler.mirror_map.refreshed == [2]
+
+
+def test_resumed_floor_five_rejects_zero_match_without_independent_evidence(monkeypatch):
+    handler = _handler()
+    handler.floor = 0
+    handler.get_floor_num = True
+    handler.mirror_map = _FloorMap()
+    monkeypatch.setattr(mirror_module, "auto", _FloorAuto(remaining_floors=0))
+    monkeypatch.setattr(mirror_module.cfg, "set_win_size", 1440)
+
+    assert handler.get_which_floor() is False
+    assert handler.floor == 0
+    assert handler.mirror_map.refreshed == []

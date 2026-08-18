@@ -77,6 +77,7 @@ class Mirror:
     CLAIM_FORFEIT_THRESHOLD = 0.42
     REWARD_LOADING_THRESHOLD = 0.85
     REWARD_LOADING_TIMEOUT = 90.0
+    REWARD_NO_PROGRESS_TIMEOUT = 30.0
 
     def __init__(self, team_setting: TeamSetting, team_num: int):
         self.logger = log
@@ -128,6 +129,7 @@ class Mirror:
         self.mirror_map = MirrorMap(hard_mode=self.hard_switch)
 
         self.pass_coins = None
+        self.run_defeated = False
 
         self.bequest_from_the_previous_game = False
         self.resumed_run = False
@@ -245,6 +247,22 @@ class Mirror:
             started_at = now
             log.debug("检测到镜牢奖励后的加载页，暂停奖励错误计数")
         return True, started_at, now - started_at >= self.REWARD_LOADING_TIMEOUT
+
+    def _reward_progress_state(
+        self,
+        started_at: float | None,
+        previous_stage: str | None,
+        current_stage: str | None,
+    ) -> tuple[float, str | None, bool]:
+        """奖励页活性看门狗；只有界面阶段变化才算进展。"""
+        now = time.monotonic()
+        if started_at is None or current_stage != previous_stage:
+            return now, current_stage, False
+        return (
+            started_at,
+            previous_stage,
+            now - started_at >= self.REWARD_NO_PROGRESS_TIMEOUT,
+        )
 
     def road_to_mir(self):
         loop_count = 30
@@ -410,8 +428,9 @@ class Mirror:
                 ):
                     break
                 retry()
-                if self.get_floor_num:
-                    self.get_which_floor()
+                if self.get_floor_num and not self.get_which_floor():
+                    log.debug("楼层尚未可靠识别，本轮跳过寻路并等待下一帧重试")
+                    continue
 
                 if cfg.floor_3_exit and self.floor >= 4:
                     continue
@@ -455,9 +474,11 @@ class Mirror:
                     or auto.find_element("teams/10_sinner_live_assets.png")
                 ):
                     continue_mirror = check_team()
-                    # 如果还有至少5人能战斗就继续，不然就退出重开
+                    # 只有明确识别到少于5人时才退出；OCR不确定不得主动放弃。
                     if continue_mirror is False and self.first_battle is False:
                         self.re_start()
+                    elif continue_mirror is None:
+                        log.warning("队伍剩余战斗力不确定，保守继续而不是误判战败")
                 if auto.click_element("battle/chaim_to_battle_assets.png") or auto.click_element(
                     "battle/normal_to_battle_assets.png"
                 ):
@@ -601,9 +622,32 @@ class Mirror:
 
         main_loop_count = 20
         auto.model = "clam"
-        failed = None
+        run_defeated = bool(self.run_defeated)
+        failed = True if run_defeated else None
         completion_confirmed = False
         reward_loading_started_at = None
+        reward_progress_started_at = None
+        reward_progress_stage = None
+
+        def check_reward_progress(stage: str | None):
+            nonlocal reward_progress_started_at, reward_progress_stage
+            (
+                reward_progress_started_at,
+                reward_progress_stage,
+                timed_out,
+            ) = self._reward_progress_state(
+                reward_progress_started_at,
+                reward_progress_stage,
+                stage,
+            )
+            if not timed_out:
+                return None
+            log.error("镜牢奖励界面连续30秒没有有效状态进展，停止重复点击并返回主界面")
+            back_init_menu()
+            if run_defeated:
+                return MirrorRunResult.DEFEATED
+            raise cannotOperateGameError("镜牢奖励领取无进展,已停止重复点击")
+
         while True:
             # 自动截图
             if auto.take_screenshot() is None:
@@ -615,9 +659,11 @@ class Mirror:
                 and cfg.floor_3_exit is False
             ):
                 failed = True
-            if auto.find_element("mirror/claim_reward/complete_mirror_100%_assets.png") or auto.find_element(
-                "mirror/claim_reward/clear_assets.png"
-            ):
+            completion_asset_visible = auto.find_element(
+                "mirror/claim_reward/complete_mirror_100%_assets.png"
+            )
+            clear_asset_visible = auto.find_element("mirror/claim_reward/clear_assets.png")
+            if (completion_asset_visible or clear_asset_visible) and not run_defeated:
                 failed = False
                 completion_confirmed = True
                 log.debug("镜牢完成度100%，能够正常领取奖励")
@@ -629,6 +675,17 @@ class Mirror:
                 reward_loading_started_at
             )
             if is_loading:
+                # 加载页使用独立的 90 秒上限；只在首次进入时更新阶段，
+                # 不能因每帧都识别到加载图而不断刷新活性计时。
+                (
+                    reward_progress_started_at,
+                    reward_progress_stage,
+                    _,
+                ) = self._reward_progress_state(
+                    reward_progress_started_at,
+                    reward_progress_stage,
+                    "loading",
+                )
                 if loading_timed_out:
                     if completion_confirmed:
                         log.warning("镜牢奖励后加载超过90秒，完成状态已确认，先记录本局结果")
@@ -638,10 +695,18 @@ class Mirror:
                 auto.model = "clam"
                 continue
             reward_loading_started_at = None
+            if reward_progress_stage == "loading":
+                check_reward_progress("loading-finished")
 
             if auto.click_element("battle/battle_finish_confirm_assets.png"):
+                timeout_result = check_reward_progress("battle-finish-confirm")
+                if timeout_result is not None:
+                    return timeout_result
                 continue
             if auto.click_element("mirror/claim_reward/rewards_acquired_assets.png"):
+                timeout_result = check_reward_progress("rewards-acquired")
+                if timeout_result is not None:
+                    return timeout_result
                 continue
             if auto.click_element(
                 "mirror/claim_reward/claim_rewards_confirm_assets.png",
@@ -649,6 +714,9 @@ class Mirror:
                 model="clam",
                 take_screenshot=True,
             ):
+                timeout_result = check_reward_progress("claim-rewards-confirm")
+                if timeout_result is not None:
+                    return timeout_result
                 continue
             if failed:
                 auto.mouse_click_blank()
@@ -658,15 +726,34 @@ class Mirror:
                 )
                 if auto.find_text_element("100", complete_mirror_bbox):
                     failed = False
+                    timeout_result = check_reward_progress("completion-ocr")
+                    if timeout_result is not None:
+                        return timeout_result
                     continue
                 if auto.click_element("mirror/claim_reward/claim_rewards_assets.png"):
+                    timeout_result = check_reward_progress("claim-rewards")
+                    if timeout_result is not None:
+                        return timeout_result
                     if self._click_claim_forfeit():
+                        failed = False
+                        timeout_result = check_reward_progress("claim-forfeit")
+                        if timeout_result is not None:
+                            return timeout_result
                         continue
                 elif self._click_claim_forfeit():
+                    failed = False
+                    timeout_result = check_reward_progress("claim-forfeit")
+                    if timeout_result is not None:
+                        return timeout_result
                     continue
             else:
                 if self.hard_switch and cfg.save_rewards:
-                    auto.click_element("mirror/claim_reward/claim_rewards_assets.png")
+                    clicked = auto.click_element("mirror/claim_reward/claim_rewards_assets.png")
+                    timeout_result = check_reward_progress(
+                        "claim-rewards" if clicked else reward_progress_stage
+                    )
+                    if timeout_result is not None:
+                        return timeout_result
                     sleep(1)
                     pos = auto.find_element(
                         "mirror/claim_reward/use_enkephalin_assets.png",
@@ -674,9 +761,15 @@ class Mirror:
                     )
                     if pos:
                         auto.mouse_click(pos[0] - 300 * (cfg.set_win_size / 1440), pos[1])
+                        timeout_result = check_reward_progress("save-rewards-selection")
+                        if timeout_result is not None:
+                            return timeout_result
                         sleep(1)
                     continue
                 elif auto.click_element("mirror/claim_reward/claim_rewards_assets.png"):
+                    timeout_result = check_reward_progress("claim-rewards")
+                    if timeout_result is not None:
+                        return timeout_result
                     sleep(1)
                     if cfg.no_weekly_bonuses:
                         bonuses = auto.find_element(
@@ -744,15 +837,27 @@ class Mirror:
                         "mirror/claim_reward/use_enkephalin_assets.png",
                         take_screenshot=True,
                     ):
+                        timeout_result = check_reward_progress("use-enkephalin")
+                        if timeout_result is not None:
+                            return timeout_result
                         sleep(1)
                     retry()
                     continue
             if auto.click_element("mirror/claim_reward/use_enkephalin_assets.png", threshold=0.75):  # 降低识别阈值
+                timeout_result = check_reward_progress("use-enkephalin")
+                if timeout_result is not None:
+                    return timeout_result
                 sleep(1)
                 continue
             # 处理周年活动弹出的窗口
             if auto.click_element("home/close_anniversary_event_assets.png"):
+                timeout_result = check_reward_progress("anniversary-close")
+                if timeout_result is not None:
+                    return timeout_result
                 continue
+            timeout_result = check_reward_progress(reward_progress_stage)
+            if timeout_result is not None:
+                return timeout_result
             retry()
             main_loop_count -= 1
             if main_loop_count % 3 == 0:
@@ -767,7 +872,7 @@ class Mirror:
             if main_loop_count < 0:
                 raise cannotOperateGameError("镜牢奖励领取出错,请手动操作重试")
 
-        if failed:
+        if run_defeated or failed:
             return MirrorRunResult.DEFEATED
         # 计时结束
         end_time = time.time()
@@ -1285,6 +1390,7 @@ class Mirror:
         # TODO耗时
         msg = f"满 身 疮 痍 ！ 重 开 ！此次战败耗时{time.time() - self.start_time}"
         log.info(msg)
+        self.run_defeated = True
         self.first_battle = True
         self.start_time = time.time()
 
@@ -1706,9 +1812,26 @@ class Mirror:
     def in_shop(self):
         self.shop.in_shop(self.floor)
 
-    def get_which_floor(self):
-        auto.click_element("mirror/road_in_mir/setting_assets.png", take_screenshot=True)
-        sleep(1)
+    def get_which_floor(self) -> bool:
+        """识别当前楼层；只有确认楼层后才允许消费或重建路线缓存。"""
+        settings_close_asset = "mirror/road_in_mir/to_window_assets.png"
+        # 上一次打开设置页后若动画超过等待上限，下一轮应直接复用已打开
+        # 的弹窗；否则设置按钮已被遮住，会永远无法重新进入识别流程。
+        to_window_position = auto.find_element(settings_close_asset)
+        if not to_window_position:
+            if not auto.click_element(
+                "mirror/road_in_mir/setting_assets.png", take_screenshot=True
+            ):
+                log.debug("设置页尚未出现且设置按钮不可用，保留楼层识别标记稍后重试")
+                return False
+            to_window_position = auto.wait_for_element(
+                settings_close_asset,
+                timeout=2.0,
+                poll_interval=0.15,
+            )
+        if not to_window_position:
+            log.debug("镜牢设置页尚未就绪，保留楼层识别标记并稍后重试")
+            return False
 
         scale = cfg.set_win_size / 1440
         floor_progress_crop = (
@@ -1717,19 +1840,57 @@ class Mirror:
             1700 * scale,
             720 * scale,
         )
-        if to_window_position := auto.find_element("mirror/road_in_mir/to_window_assets.png", take_screenshot=True):
-            not_passed_floors = auto.find_element(
-                "mirror/road_in_mir/not_passed_floor.png",
-                find_type="image_with_multiple_targets",
-                my_crop=floor_progress_crop,
-                take_screenshot=True,
-                min_dist= 80 * scale
+        not_passed_floors = auto.find_element(
+            "mirror/road_in_mir/not_passed_floor.png",
+            find_type="image_with_multiple_targets",
+            my_crop=floor_progress_crop,
+            min_dist=80 * scale,
+        )
+        remaining_floor_count = len(not_passed_floors or ())
+        detected_floor = 5 - remaining_floor_count
+
+        # 正常流程每选完一次卡包只可能进入下一层。模板暂时一个都没
+        # 匹配到时不能直接把 5 - 0 当作第五层；连续两帧结果仍异常时，
+        # 使用已经由卡包切换确认的顺序楼层，避免识别失败永久卡住。
+        first_pack_recorded = bool(self.floor_times and self.floor_times[0] is not None)
+        expected_floor = self.floor + 1 if self.floor > 0 else (1 if first_pack_recorded else None)
+        valid_floor = False
+        new_floor = detected_floor
+        if expected_floor is not None:
+            if detected_floor == expected_floor:
+                valid_floor = True
+                self._floor_fallback_candidate = None
+                self._floor_fallback_confirmations = 0
+            else:
+                candidate = (expected_floor, detected_floor)
+                if getattr(self, "_floor_fallback_candidate", None) == candidate:
+                    self._floor_fallback_confirmations = getattr(self, "_floor_fallback_confirmations", 0) + 1
+                else:
+                    self._floor_fallback_candidate = candidate
+                    self._floor_fallback_confirmations = 1
+                if self._floor_fallback_confirmations >= 2:
+                    new_floor = expected_floor
+                    valid_floor = True
+                    log.warning(
+                        f"楼层模板连续异常({detected_floor})，按卡包顺序确认当前为第{expected_floor}层"
+                    )
+        elif remaining_floor_count > 0 and 1 <= detected_floor <= 4:
+            # 断点续跑没有顺序上下文，只接受至少检测到一个“未通过楼层”
+            # 的正向证据；零匹配既可能是第五层，也可能是模板加载失败。
+            valid_floor = True
+
+        auto.mouse_action_with_pos(
+            (to_window_position[0] - 200 * scale, to_window_position[1])
+        )
+        if not valid_floor:
+            log.warning(
+                f"忽略不可靠的镜牢楼层识别结果: 当前{self.floor}, "
+                f"模板推断{detected_floor}, 期望{expected_floor}"
             )
-            not_passed_floor_count = len(not_passed_floors)
-            self.floor = 5 - not_passed_floor_count
-            log.debug(f"当前镜牢层数: {self.floor}")
-            self.get_floor_num = False
-            auto.mouse_action_with_pos(
-                (to_window_position[0] - 200 * cfg.set_win_size / 1440, to_window_position[1])
-            )
-            self.mirror_map.refresh_floor(self.floor)
+            return False
+
+        self.floor = new_floor
+        self.get_floor_num = False
+        log.debug(f"当前镜牢层数: {self.floor}")
+        self.mirror_map.refresh_floor(self.floor)
+        return True
