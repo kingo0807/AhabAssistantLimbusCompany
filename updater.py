@@ -5,6 +5,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
@@ -21,10 +23,12 @@ from typing import Any
 
 import psutil
 
-UPDATER_VERSION = "1.2.0"
+UPDATER_VERSION = "1.3.0"
 REPOSITORY = "kingo0807/AhabAssistantLimbusCompany"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 MANIFEST_ASSET_NAME = "update-manifest.json"
+LATEST_MANIFEST_URL = f"https://github.com/{REPOSITORY}/releases/latest/download/{MANIFEST_ASSET_NAME}"
+RELEASE_DOWNLOAD_BASE = f"https://github.com/{REPOSITORY}/releases/download"
 DEFAULT_PACKAGE_ASSET = "AALC-Optimized-win64.zip"
 ENTRYPOINT = "AALC.exe"
 USER_AGENT = f"AALC-Optimized-Updater/{UPDATER_VERSION}"
@@ -40,6 +44,31 @@ SW_SHOWNORMAL = 1
 
 class UpdaterError(RuntimeError):
     """更新无法安全完成。"""
+
+
+class UpdateNetworkError(UpdaterError):
+    """读取远端更新信息时发生网络错误。"""
+
+
+_SAFE_RELEASE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
+_SAFE_ZIP_ASSET = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.zip\Z", re.IGNORECASE)
+
+
+def _validate_release_version(value: Any) -> str:
+    if not isinstance(value, str) or _SAFE_RELEASE_VERSION.fullmatch(value) is None:
+        raise UpdaterError("更新清单没有安全有效的版本号")
+    return value
+
+
+def release_asset_url(version: str, asset: str) -> str:
+    """根据已验证的清单字段构造公开 Release 资产直链。"""
+    safe_version = _validate_release_version(version)
+    if not isinstance(asset, str) or _SAFE_ZIP_ASSET.fullmatch(asset) is None:
+        raise UpdaterError("更新清单没有安全有效的 ZIP 资产名")
+    return (
+        f"{RELEASE_DOWNLOAD_BASE}/"
+        f"{urllib.parse.quote(safe_version, safe='')}/{urllib.parse.quote(asset, safe='')}"
+    )
 
 
 @dataclass(frozen=True)
@@ -63,7 +92,8 @@ class UpdateManifest:
         if not isinstance(payload, dict) or payload.get("schema_version") != 1:
             raise UpdaterError("更新清单格式或版本不受支持")
 
-        version = payload.get("version")
+        release_tag = _validate_release_version(release_tag)
+        version = _validate_release_version(payload.get("version"))
         asset = payload.get("asset")
         sha256 = payload.get("sha256")
         size = payload.get("size")
@@ -72,8 +102,8 @@ class UpdateManifest:
 
         if version != release_tag:
             raise UpdaterError(f"更新清单版本 {version!r} 与 Release {release_tag!r} 不一致")
-        if not isinstance(asset, str) or not asset.lower().endswith(".zip"):
-            raise UpdaterError("更新清单没有有效的 ZIP 资产名")
+        if not isinstance(asset, str) or _SAFE_ZIP_ASSET.fullmatch(asset) is None:
+            raise UpdaterError("更新清单没有安全有效的 ZIP 资产名")
         if not isinstance(sha256, str) or len(sha256) != 64:
             raise UpdaterError("更新清单没有有效的 SHA-256")
         try:
@@ -88,6 +118,12 @@ class UpdateManifest:
             raise UpdaterError("更新压缩包必须使用 AALC 根目录")
 
         return cls(version, asset, sha256.lower(), size, entrypoint, archive_root)
+
+    @classmethod
+    def from_latest_json(cls, payload: Any) -> "UpdateManifest":
+        """解析不依赖 GitHub API 的 latest Release 清单。"""
+        release_tag = payload.get("version") if isinstance(payload, dict) else None
+        return cls.from_json(payload, release_tag)
 
 
 def _request(url: str, timeout: int = 30):
@@ -105,9 +141,13 @@ def _request(url: str, timeout: int = 30):
 def fetch_json(url: str) -> Any:
     try:
         with _request(url) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise UpdaterError(f"无法读取更新信息：{exc}") from exc
+            content = response.read()
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise UpdateNetworkError(f"无法读取更新信息：{exc}") from exc
+    try:
+        return json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise UpdaterError(f"更新信息不是有效的 UTF-8 JSON：{exc}") from exc
 
 
 def download_file(url: str, destination: Path, expected_size: int | None = None) -> None:
@@ -368,12 +408,23 @@ class StandaloneUpdater:
 
     def _load_release(self) -> tuple[str, dict[str, ReleaseAsset], UpdateManifest]:
         print(f"正在检查 {REPOSITORY} 的最新版本……")
-        tag, assets = parse_release(fetch_json(self.api_url))
-        manifest_asset = assets.get(MANIFEST_ASSET_NAME)
-        if manifest_asset is None:
-            raise UpdaterError(f"最新 Release 缺少 {MANIFEST_ASSET_NAME}")
-        manifest = UpdateManifest.from_json(fetch_json(manifest_asset.url), tag)
-        return tag, assets, manifest
+        try:
+            tag, assets = parse_release(fetch_json(self.api_url))
+            manifest_asset = assets.get(MANIFEST_ASSET_NAME)
+            if manifest_asset is None:
+                raise UpdaterError(f"最新 Release 缺少 {MANIFEST_ASSET_NAME}")
+            manifest = UpdateManifest.from_json(fetch_json(manifest_asset.url), tag)
+            return tag, assets, manifest
+        except UpdateNetworkError as api_error:
+            print(f"GitHub API 暂不可用，改用公开 Release 直链：{api_error}")
+
+        manifest = UpdateManifest.from_latest_json(fetch_json(LATEST_MANIFEST_URL))
+        package = ReleaseAsset(
+            manifest.asset,
+            release_asset_url(manifest.version, manifest.asset),
+            manifest.size,
+        )
+        return manifest.version, {manifest.asset: package}, manifest
 
     def run(
         self,

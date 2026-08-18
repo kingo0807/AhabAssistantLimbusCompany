@@ -1,4 +1,5 @@
 import hashlib
+import urllib.error
 import zipfile
 from argparse import Namespace
 
@@ -7,9 +8,14 @@ import pytest
 
 from updater import (
     ENTRYPOINT,
+    LATEST_MANIFEST_URL,
+    RELEASE_DOWNLOAD_BASE,
+    StandaloneUpdater,
     UpdateManifest,
+    UpdateNetworkError,
     UpdaterError,
     extract_verified_zip,
+    fetch_json,
     launch_entrypoint,
     parse_release,
     relaunch_worker,
@@ -63,6 +69,133 @@ def test_manifest_requires_release_tag_to_match():
             },
             "v1.0.0",
         )
+
+
+def _manifest_payload(**overrides):
+    payload = {
+        "schema_version": 1,
+        "version": "v1.0.0",
+        "asset": "AALC-Optimized-win64.zip",
+        "sha256": "0" * 64,
+        "size": 123,
+        "entrypoint": ENTRYPOINT,
+        "archive_root": "AALC",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_release_api_network_error_falls_back_to_public_manifest(tmp_path, monkeypatch, capsys):
+    api_url = "https://api.example.invalid/releases/latest"
+    calls = []
+
+    def fake_fetch(url):
+        calls.append(url)
+        if url == api_url:
+            raise UpdateNetworkError("HTTP Error 403: rate limit exceeded")
+        assert url == LATEST_MANIFEST_URL
+        return _manifest_payload(version="v1.0.0+fast")
+
+    monkeypatch.setattr("updater.fetch_json", fake_fetch)
+
+    tag, assets, manifest = StandaloneUpdater(tmp_path, api_url)._load_release()
+
+    assert calls == [api_url, LATEST_MANIFEST_URL]
+    assert tag == manifest.version == "v1.0.0+fast"
+    assert assets[manifest.asset].url == (
+        f"{RELEASE_DOWNLOAD_BASE}/v1.0.0%2Bfast/AALC-Optimized-win64.zip"
+    )
+    assert "改用公开 Release 直链" in capsys.readouterr().out
+
+
+def test_fetch_json_classifies_http_403_as_network_error(monkeypatch):
+    error = urllib.error.HTTPError(
+        "https://api.example.invalid/releases/latest",
+        403,
+        "rate limit exceeded",
+        None,
+        None,
+    )
+    monkeypatch.setattr("updater._request", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+
+    with pytest.raises(UpdateNetworkError, match="403.*rate limit exceeded"):
+        fetch_json("https://api.example.invalid/releases/latest")
+
+
+def test_release_api_success_does_not_use_fallback(tmp_path, monkeypatch):
+    api_url = "https://api.example.invalid/releases/latest"
+    manifest_url = "https://downloads.example.invalid/update-manifest.json"
+    package_url = "https://downloads.example.invalid/AALC-Optimized-win64.zip"
+    calls = []
+
+    def fake_fetch(url):
+        calls.append(url)
+        if url == api_url:
+            return {
+                "tag_name": "v1.0.0",
+                "draft": False,
+                "prerelease": False,
+                "assets": [
+                    {"name": "update-manifest.json", "browser_download_url": manifest_url, "size": 100},
+                    {
+                        "name": "AALC-Optimized-win64.zip",
+                        "browser_download_url": package_url,
+                        "size": 123,
+                    },
+                ],
+            }
+        assert url == manifest_url
+        return _manifest_payload()
+
+    monkeypatch.setattr("updater.fetch_json", fake_fetch)
+
+    tag, assets, manifest = StandaloneUpdater(tmp_path, api_url)._load_release()
+
+    assert calls == [api_url, manifest_url]
+    assert tag == manifest.version == "v1.0.0"
+    assert assets[manifest.asset].url == package_url
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"version": "../v1.0.0"}, "版本号"),
+        ({"asset": "../payload.zip"}, "ZIP 资产名"),
+        ({"sha256": "not-a-sha256"}, "SHA-256"),
+        ({"size": 0}, "文件大小"),
+    ],
+)
+def test_public_manifest_fallback_rejects_unsafe_or_invalid_fields(
+    tmp_path, monkeypatch, overrides, message
+):
+    api_url = "https://api.example.invalid/releases/latest"
+
+    def fake_fetch(url):
+        if url == api_url:
+            raise UpdateNetworkError("HTTP Error 403: rate limit exceeded")
+        assert url == LATEST_MANIFEST_URL
+        return _manifest_payload(**overrides)
+
+    monkeypatch.setattr("updater.fetch_json", fake_fetch)
+
+    with pytest.raises(UpdaterError, match=message):
+        StandaloneUpdater(tmp_path, api_url)._load_release()
+
+
+def test_invalid_api_response_is_not_hidden_by_fallback(tmp_path, monkeypatch):
+    api_url = "https://api.example.invalid/releases/latest"
+    calls = []
+
+    def fake_fetch(url):
+        calls.append(url)
+        return {"unexpected": True}
+
+    monkeypatch.setattr("updater.fetch_json", fake_fetch)
+
+    with pytest.raises(UpdaterError, match="响应格式无效|缺少版本号"):
+        StandaloneUpdater(tmp_path, api_url)._load_release()
+
+    assert calls == [api_url]
 
 
 def test_extract_verified_zip_rejects_path_escape(tmp_path):
