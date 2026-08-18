@@ -1,8 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
 from pathlib import Path
 
 import rapidocr
-import sys
+
 sys.modules['FixTk'] = None
 
 block_cipher = None
@@ -26,10 +27,28 @@ for v in yaml_paths:
 
 add_data = list(set(yaml_add_data + onnx_add_data))
 
+# Conda 的 Python 扩展依赖位于 Library/bin，PyInstaller 在未激活环境时
+# 不一定能递归解析到。显式收集可避免程序启动后在 SSL/OCR 路径才报缺 DLL。
+runtime_dll_names = (
+    "libcrypto-3-x64.dll",
+    "libssl-3-x64.dll",
+    "liblzma.dll",
+    "libbz2.dll",
+    "libmpdec-4.dll",
+    "libexpat.dll",
+    "ffi.dll",
+)
+runtime_dll_dir = Path(sys.prefix) / "Library" / "bin"
+runtime_binaries = [
+    (str(runtime_dll_dir / name), ".")
+    for name in runtime_dll_names
+    if (runtime_dll_dir / name).is_file()
+]
+
 a = Analysis(
     ["main.py"],
     pathex=[],
-    binaries=[],
+    binaries=runtime_binaries,
     datas=add_data,
     hiddenimports=[],
     hookspath=[],
