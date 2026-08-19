@@ -23,13 +23,14 @@ from typing import Any
 
 import psutil
 
-UPDATER_VERSION = "1.4.1"
+UPDATER_VERSION = "1.5.0"
 REPOSITORY = "kingo0807/AhabAssistantLimbusCompany"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 MANIFEST_ASSET_NAME = "update-manifest.json"
 LATEST_MANIFEST_URL = f"https://github.com/{REPOSITORY}/releases/latest/download/{MANIFEST_ASSET_NAME}"
 RELEASE_DOWNLOAD_BASE = f"https://github.com/{REPOSITORY}/releases/download"
 DEFAULT_PACKAGE_ASSET = "AALC-Optimized-win64.zip"
+PACKAGE_VERSION_MEMBER = "AALC/assets/config/version.txt"
 ENTRYPOINT = "AALC.exe"
 USER_AGENT = f"AALC-Optimized-Updater/{UPDATER_VERSION}"
 PRESERVE_FILES = ("config.yaml", "theme_pack_list.yaml")
@@ -254,6 +255,37 @@ def extract_verified_zip(archive: Path, destination: Path, manifest: UpdateManif
     return payload_root
 
 
+def inspect_local_archive(archive: Path) -> UpdateManifest:
+    """从本地更新包读取版本；不访问网络，并以源文件摘要校验复制结果。"""
+    archive = archive.resolve()
+    if not archive.is_file():
+        raise UpdaterError(f"找不到本地更新包：{archive}")
+    if _SAFE_ZIP_ASSET.fullmatch(archive.name) is None:
+        raise UpdaterError(f"更新包文件名不安全，请改名为 {DEFAULT_PACKAGE_ASSET}")
+
+    try:
+        with zipfile.ZipFile(archive) as package:
+            version_info = package.getinfo(PACKAGE_VERSION_MEMBER)
+            if version_info.file_size <= 0 or version_info.file_size > 256:
+                raise UpdaterError("更新包内的版本文件大小异常")
+            version = package.read(version_info).decode("utf-8").strip()
+    except KeyError as exc:
+        raise UpdaterError(f"更新包缺少版本文件 {PACKAGE_VERSION_MEMBER}") from exc
+    except UnicodeDecodeError as exc:
+        raise UpdaterError("更新包内的版本文件不是有效的 UTF-8") from exc
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise UpdaterError(f"无法读取本地更新包：{exc}") from exc
+
+    return UpdateManifest(
+        version=_validate_release_version(version),
+        asset=archive.name,
+        sha256=sha256_file(archive),
+        size=archive.stat().st_size,
+        entrypoint=ENTRYPOINT,
+        archive_root="AALC",
+    )
+
+
 def _copy_preserved_data(source: Path, destination: Path) -> None:
     for name in PRESERVE_FILES:
         item = source / name
@@ -456,6 +488,97 @@ def _rename_directory_with_retry(
     raise UpdaterError(f"Windows 未能释放 AALC 目录（已重试 {len(DIRECTORY_SWITCH_RETRY_DELAYS)} 次）{suffix}") from last_error
 
 
+def _remove_tree_entry(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _mirror_tree(source: Path, destination: Path) -> None:
+    """把 source 精确镜像到既有目录；根目录本身不改名、不删除。"""
+    source = source.resolve()
+    destination = destination.resolve()
+    if not source.is_dir() or not destination.is_dir():
+        raise UpdaterError("原目录兼容安装需要两个已存在的目录")
+    if _same_or_child(source, destination) or _same_or_child(destination, source):
+        raise UpdaterError("拒绝在相互嵌套的目录之间执行兼容安装")
+
+    source_files: set[Path] = set()
+    source_directories: set[Path] = {Path()}
+    for root, directories, files in os.walk(source, followlinks=False):
+        root_path = Path(root)
+        relative_root = root_path.relative_to(source)
+        for name in directories:
+            item = root_path / name
+            relative = relative_root / name
+            if item.is_symlink():
+                raise UpdaterError(f"更新内容不允许目录链接：{relative}")
+            source_directories.add(relative)
+        for name in files:
+            item = root_path / name
+            relative = relative_root / name
+            if item.is_symlink():
+                raise UpdaterError(f"更新内容不允许文件链接：{relative}")
+            source_files.add(relative)
+
+    for relative in sorted(source_directories, key=lambda item: len(item.parts)):
+        if not relative.parts:
+            continue
+        target = destination / relative
+        if target.is_symlink() or (target.exists() and not target.is_dir()):
+            _remove_tree_entry(target)
+        target.mkdir(parents=True, exist_ok=True)
+
+    for relative in sorted(source_files, key=lambda item: item.as_posix().casefold()):
+        source_file = source / relative
+        target = destination / relative
+        if target.exists() and target.is_dir():
+            _remove_tree_entry(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.update-{uuid.uuid4().hex[:8]}")
+        try:
+            shutil.copy2(source_file, temporary)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    for root, directories, files in os.walk(destination, topdown=False, followlinks=False):
+        root_path = Path(root)
+        relative_root = root_path.relative_to(destination)
+        for name in files:
+            relative = relative_root / name
+            if relative not in source_files:
+                _remove_tree_entry(root_path / name)
+        for name in directories:
+            relative = relative_root / name
+            target = root_path / name
+            if target.is_symlink() or relative not in source_directories:
+                _remove_tree_entry(target)
+
+
+def _install_in_place_with_backup(install_dir: Path, staging: Path, backup: Path) -> None:
+    """目录句柄阻止根目录改名时，完整备份后在原目录内安装。"""
+    try:
+        shutil.copytree(install_dir, backup)
+    except Exception as exc:
+        shutil.rmtree(backup, ignore_errors=True)
+        raise UpdaterError(f"无法创建完整备份，尚未修改原目录：{exc}") from exc
+
+    try:
+        _mirror_tree(staging, install_dir)
+    except Exception as install_exc:
+        try:
+            _mirror_tree(backup, install_dir)
+        except Exception as rollback_exc:
+            raise UpdaterError(
+                f"原目录兼容安装失败且自动回滚失败；旧版本完整备份位于 {backup}：{rollback_exc}"
+            ) from install_exc
+        raise UpdaterError(
+            f"原目录兼容安装失败，已从完整备份恢复旧版本；备份位于 {backup}：{install_exc}"
+        ) from install_exc
+
+
 def launch_entrypoint(install_dir: Path) -> bool:
     """启动更新后的 AALC；需要管理员权限时改用 ShellExecute 请求 UAC。"""
     executable = install_dir / ENTRYPOINT
@@ -508,6 +631,7 @@ def transactional_install(
 
     old_moved = False
     new_installed = False
+    in_place_attempted = False
     try:
         print("正在准备新版本……")
         shutil.copytree(payload_root, staging)
@@ -519,11 +643,20 @@ def transactional_install(
         _copy_preserved_data(install_dir, staging)
 
         print("正在切换版本……")
-        _rename_directory_with_retry(install_dir, backup, blocker_root=install_dir)
-        old_moved = True
-        _rename_directory_with_retry(staging, install_dir)
-        new_installed = True
+        try:
+            _rename_directory_with_retry(install_dir, backup, blocker_root=install_dir)
+        except UpdaterError as switch_error:
+            in_place_attempted = True
+            print(f"整目录切换不可用，改用完整备份后的原目录兼容安装：{switch_error}")
+            _install_in_place_with_backup(install_dir, staging, backup)
+            new_installed = True
+        else:
+            old_moved = True
+            _rename_directory_with_retry(staging, install_dir)
+            new_installed = True
     except Exception as exc:
+        if in_place_attempted and not old_moved:
+            raise UpdaterError(f"安装失败：{exc}") from exc
         original_restored = not old_moved
         if new_installed and install_dir.exists():
             failed = install_dir.parent / f".{install_dir.name}.failed-{uuid.uuid4().hex[:8]}"
@@ -587,12 +720,18 @@ class StandaloneUpdater:
         launch: bool = True,
         force: bool = False,
     ) -> Path | None:
-        tag, assets, manifest = self._load_release()
-        package_asset = assets.get(manifest.asset)
-        if package_asset is None:
-            raise UpdaterError(f"最新 Release 缺少 {manifest.asset}")
-        if manifest.size is not None and package_asset.size is not None and manifest.size != package_asset.size:
-            raise UpdaterError("Release 资产大小与更新清单不一致")
+        if source_archive is None:
+            tag, assets, manifest = self._load_release()
+            package_asset = assets.get(manifest.asset)
+            if package_asset is None:
+                raise UpdaterError(f"最新 Release 缺少 {manifest.asset}")
+            if manifest.size is not None and package_asset.size is not None and manifest.size != package_asset.size:
+                raise UpdaterError("Release 资产大小与更新清单不一致")
+        else:
+            print(f"正在读取本地更新包：{source_archive}")
+            manifest = inspect_local_archive(source_archive)
+            tag = manifest.version
+            package_asset = ReleaseAsset(manifest.asset, "", manifest.size)
         if check_only:
             print(f"最新可用版本：{tag}")
             return None
@@ -613,7 +752,7 @@ class StandaloneUpdater:
                 print(f"正在下载 {manifest.asset}……")
                 download_file(package_asset.url, package_path, manifest.size or package_asset.size)
             else:
-                print(f"正在验证已下载的更新包：{source_archive}")
+                print(f"正在验证并复制本地更新包：{source_archive}")
                 shutil.copy2(source_archive, package_path)
             actual_hash = sha256_file(package_path)
             if actual_hash != manifest.sha256:
@@ -652,6 +791,16 @@ def _resolve_legacy_archive(install_dir: Path, value: str | None) -> Path | None
     if not candidate.is_file():
         raise UpdaterError(f"找不到已下载的更新包：{candidate}")
     return candidate
+
+
+def find_local_archive(install_dir: Path) -> Path:
+    archive = (install_dir / DEFAULT_PACKAGE_ASSET).resolve()
+    if not archive.is_file():
+        raise UpdaterError(
+            f"请先下载 {DEFAULT_PACKAGE_ASSET}，把它放到当前 AALC 文件夹后再双击 AALC-Update.exe；"
+            f"应放置在：{archive}"
+        )
+    return archive
 
 
 def relaunch_worker(args: argparse.Namespace, install_dir: Path, source_archive: Path | None) -> None:
@@ -725,6 +874,8 @@ def main(argv: list[str] | None = None) -> int:
         install_dir = resolve_install_dir(args, executable)
         print(f"本次只更新此目录：{install_dir}")
         source_archive = args.source_archive or _resolve_legacy_archive(install_dir, args.legacy_archive)
+        if source_archive is None and not args.worker and not args.check_only:
+            source_archive = find_local_archive(install_dir)
         if not args.worker and not args.no_relaunch:
             if not (install_dir / ENTRYPOINT).is_file():
                 raise UpdaterError(f"请把更新程序放入 AALC 文件夹后再双击；此处缺少 {ENTRYPOINT}")

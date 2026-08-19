@@ -17,6 +17,8 @@ from updater import (
     UpdaterError,
     extract_verified_zip,
     fetch_json,
+    find_local_archive,
+    inspect_local_archive,
     launch_entrypoint,
     parse_release,
     relaunch_worker,
@@ -209,6 +211,54 @@ def test_extract_verified_zip_rejects_path_escape(tmp_path):
         extract_verified_zip(archive, tmp_path / "out", _manifest())
 
     assert not (tmp_path / "outside.txt").exists()
+
+
+def test_inspect_local_archive_reads_version_without_network(tmp_path):
+    archive = tmp_path / "AALC-Optimized-win64.zip"
+    with zipfile.ZipFile(archive, "w") as package:
+        package.writestr("AALC/AALC.exe", b"new")
+        package.writestr("AALC/assets/config/version.txt", "v1.2.3-local")
+
+    manifest = inspect_local_archive(archive)
+
+    assert manifest.version == "v1.2.3-local"
+    assert manifest.asset == archive.name
+    assert manifest.size == archive.stat().st_size
+    assert manifest.sha256 == hashlib.sha256(archive.read_bytes()).hexdigest()
+
+
+def test_find_local_archive_requires_fixed_name_in_selected_folder(tmp_path):
+    install = tmp_path / "AALC"
+    install.mkdir()
+    expected = install / "AALC-Optimized-win64.zip"
+
+    with pytest.raises(UpdaterError, match="应放置在"):
+        find_local_archive(install)
+
+    expected.write_bytes(b"zip")
+    assert find_local_archive(install) == expected.resolve()
+
+
+def test_local_archive_update_never_reads_network(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+    install.mkdir()
+    (install / ENTRYPOINT).write_bytes(b"old")
+    archive = tmp_path / "AALC-Optimized-win64.zip"
+    with zipfile.ZipFile(archive, "w") as package:
+        package.writestr("AALC/AALC.exe", b"new")
+        package.writestr("AALC/assets/config/version.txt", "v1.2.3-offline")
+
+    monkeypatch.setattr(
+        "updater.fetch_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不应访问网络")),
+    )
+    monkeypatch.setattr("updater.stop_target_processes", lambda _install: None)
+
+    backup = StandaloneUpdater(install).run(source_archive=archive, launch=False)
+
+    assert backup is not None
+    assert (install / ENTRYPOINT).read_bytes() == b"new"
+    assert (install / ".aalc-release.json").read_text(encoding="utf-8").find("v1.2.3-offline") >= 0
 
 
 def test_transactional_install_preserves_user_data_and_keeps_backup(tmp_path, monkeypatch):
@@ -554,13 +604,17 @@ def test_transactional_install_retries_transient_windows_directory_lock(tmp_path
     assert (backup / ENTRYPOINT).read_bytes() == b"old"
 
 
-def test_transactional_install_reports_untouched_old_version_after_permanent_lock(tmp_path, monkeypatch):
+def test_transactional_install_falls_back_to_in_place_mirror_after_permanent_lock(tmp_path, monkeypatch):
     install = tmp_path / "AALC"
     payload = tmp_path / "payload" / "AALC"
     install.mkdir()
     payload.mkdir(parents=True)
     (install / ENTRYPOINT).write_bytes(b"old")
+    (install / "stale.txt").write_text("old", encoding="utf-8")
+    (install / "config.yaml").write_text("user: true", encoding="utf-8")
     (payload / ENTRYPOINT).write_bytes(b"new")
+    (payload / "new.txt").write_text("new", encoding="utf-8")
+    (payload / "config.yaml").write_text("default: true", encoding="utf-8")
     original_rename = Path.rename
 
     def locked_rename(path, destination):
@@ -573,11 +627,53 @@ def test_transactional_install_reports_untouched_old_version_after_permanent_loc
     monkeypatch.setattr("updater.time.sleep", lambda _delay: None)
     monkeypatch.setattr("updater._blocking_process_summary", lambda _root: "cmd.exe (PID 42：当前工作目录位于该目录)")
 
-    with pytest.raises(UpdaterError, match="旧版本未移动，原目录保持不变") as exc_info:
+    backup = transactional_install(install, payload, "v1.0.2", launch=False)
+
+    assert (install / ENTRYPOINT).read_bytes() == b"new"
+    assert (install / "new.txt").read_text(encoding="utf-8") == "new"
+    assert not (install / "stale.txt").exists()
+    assert (install / "config.yaml").read_text(encoding="utf-8") == "user: true"
+    assert (backup / ENTRYPOINT).read_bytes() == b"old"
+    assert (backup / "stale.txt").read_text(encoding="utf-8") == "old"
+
+
+def test_in_place_mirror_rolls_back_partial_update(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+    payload = tmp_path / "payload" / "AALC"
+    install.mkdir()
+    payload.mkdir(parents=True)
+    (install / ENTRYPOINT).write_bytes(b"old")
+    (install / "stale.txt").write_text("old", encoding="utf-8")
+    (payload / ENTRYPOINT).write_bytes(b"new")
+    original_rename = Path.rename
+    updater_module = __import__("updater")
+    real_mirror = updater_module._mirror_tree
+    mirror_calls = 0
+
+    def locked_rename(path, destination):
+        if path == install:
+            raise PermissionError(5, "directory remains locked")
+        return original_rename(path, destination)
+
+    def fail_first_mirror(source, destination):
+        nonlocal mirror_calls
+        mirror_calls += 1
+        if mirror_calls == 1:
+            (destination / ENTRYPOINT).write_bytes(b"partial")
+            (destination / "stale.txt").unlink()
+            raise OSError(32, "simulated file lock")
+        return real_mirror(source, destination)
+
+    monkeypatch.setattr("updater.Path.rename", locked_rename)
+    monkeypatch.setattr("updater.stop_target_processes", lambda _install: None)
+    monkeypatch.setattr("updater.time.sleep", lambda _delay: None)
+    monkeypatch.setattr("updater._mirror_tree", fail_first_mirror)
+
+    with pytest.raises(UpdaterError, match="已从完整备份恢复旧版本"):
         transactional_install(install, payload, "v1.0.2", launch=False)
 
-    assert "cmd.exe" in str(exc_info.value)
     assert (install / ENTRYPOINT).read_bytes() == b"old"
+    assert (install / "stale.txt").read_text(encoding="utf-8") == "old"
 
 
 def test_transactional_install_restores_backup_when_staging_switch_fails(tmp_path, monkeypatch):
