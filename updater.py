@@ -23,7 +23,7 @@ from typing import Any
 
 import psutil
 
-UPDATER_VERSION = "1.4.0"
+UPDATER_VERSION = "1.4.1"
 REPOSITORY = "kingo0807/AhabAssistantLimbusCompany"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 MANIFEST_ASSET_NAME = "update-manifest.json"
@@ -342,6 +342,26 @@ def _collect_target_processes(install_dir: Path) -> list[psutil.Process]:
     return list(targets.values())
 
 
+def _wait_target_processes(
+    processes: list[psutil.Process],
+    timeout: float,
+) -> tuple[list[psutil.Process], list[psutil.Process]]:
+    """兼容 Windows 无权打开高权限进程句柄的情况，并把它保留在 alive 中供诊断。"""
+    try:
+        return psutil.wait_procs(processes, timeout=timeout)
+    except psutil.AccessDenied:
+        gone: list[psutil.Process] = []
+        alive: list[psutil.Process] = []
+        for process in processes:
+            try:
+                (alive if process.is_running() else gone).append(process)
+            except psutil.NoSuchProcess:
+                gone.append(process)
+            except (psutil.AccessDenied, OSError):
+                alive.append(process)
+        return gone, alive
+
+
 def stop_target_processes(install_dir: Path) -> None:
     targets = _collect_target_processes(install_dir)
     if not targets:
@@ -352,13 +372,13 @@ def stop_target_processes(install_dir: Path) -> None:
             process.terminate()
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             pass
-    _, alive = psutil.wait_procs(targets, timeout=10)
+    _, alive = _wait_target_processes(targets, timeout=10)
     for process in alive:
         try:
             process.kill()
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             pass
-    _, alive = psutil.wait_procs(alive, timeout=5)
+    _, alive = _wait_target_processes(alive, timeout=5)
     if alive:
         names = []
         for process in alive[:6]:

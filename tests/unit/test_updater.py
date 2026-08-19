@@ -490,6 +490,40 @@ def test_stop_processes_closes_external_descendant_spawned_by_aalc(tmp_path, mon
     assert terminal.terminated is True
 
 
+def test_stop_processes_reports_elevated_process_when_wait_access_is_denied(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+
+    class ElevatedProcess:
+        info = {"pid": 1001, "name": ENTRYPOINT, "exe": str(install / ENTRYPOINT)}
+        pid = 1001
+
+        def children(self, recursive=False):
+            return []
+
+        def terminate(self):
+            raise psutil.AccessDenied(pid=self.pid)
+
+        def kill(self):
+            raise psutil.AccessDenied(pid=self.pid)
+
+        def is_running(self):
+            return True
+
+        def name(self):
+            return ENTRYPOINT
+
+    process = ElevatedProcess()
+    monkeypatch.setattr("updater.os.getpid", lambda: 999)
+    monkeypatch.setattr("updater.psutil.process_iter", lambda _attrs: [process])
+    monkeypatch.setattr(
+        "updater.psutil.wait_procs",
+        lambda _processes, timeout: (_ for _ in ()).throw(psutil.AccessDenied(pid=process.pid)),
+    )
+
+    with pytest.raises(UpdaterError, match=r"AALC\.exe \(PID 1001\)"):
+        stop_target_processes(install)
+
+
 def test_transactional_install_retries_transient_windows_directory_lock(tmp_path, monkeypatch):
     install = tmp_path / "AALC"
     payload = tmp_path / "payload" / "AALC"
