@@ -676,6 +676,30 @@ def test_in_place_mirror_rolls_back_partial_update(tmp_path, monkeypatch):
     assert (install / "stale.txt").read_text(encoding="utf-8") == "old"
 
 
+def test_in_place_mirror_writes_release_marker_last(tmp_path, monkeypatch):
+    updater_module = __import__("updater")
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    (source / ENTRYPOINT).write_bytes(b"new")
+    (source / ".aalc-release.json").write_text('{"version":"new"}', encoding="utf-8")
+    (destination / ENTRYPOINT).write_bytes(b"old")
+    writes = []
+    real_replace = updater_module.os.replace
+
+    def record_replace(source_file, target):
+        writes.append(Path(target).name)
+        return real_replace(source_file, target)
+
+    monkeypatch.setattr("updater.os.replace", record_replace)
+
+    updater_module._mirror_tree(source, destination)
+
+    assert writes[-1] == ".aalc-release.json"
+    assert (destination / ENTRYPOINT).read_bytes() == b"new"
+
+
 def test_transactional_install_restores_backup_when_staging_switch_fails(tmp_path, monkeypatch):
     install = tmp_path / "AALC"
     payload = tmp_path / "payload" / "AALC"

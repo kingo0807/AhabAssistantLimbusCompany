@@ -530,7 +530,9 @@ def _mirror_tree(source: Path, destination: Path) -> None:
             _remove_tree_entry(target)
         target.mkdir(parents=True, exist_ok=True)
 
-    for relative in sorted(source_files, key=lambda item: item.as_posix().casefold()):
+    completion_marker = Path(".aalc-release.json")
+
+    def copy_source_file(relative: Path) -> None:
         source_file = source / relative
         target = destination / relative
         if target.exists() and target.is_dir():
@@ -542,6 +544,9 @@ def _mirror_tree(source: Path, destination: Path) -> None:
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
+
+    for relative in sorted(source_files - {completion_marker}, key=lambda item: item.as_posix().casefold()):
+        copy_source_file(relative)
 
     for root, directories, files in os.walk(destination, topdown=False, followlinks=False):
         root_path = Path(root)
@@ -555,6 +560,10 @@ def _mirror_tree(source: Path, destination: Path) -> None:
             target = root_path / name
             if target.is_symlink() or relative not in source_directories:
                 _remove_tree_entry(target)
+
+    # 完成标记必须最后提交，避免外部程序在主文件尚未替换完时误判更新成功。
+    if completion_marker in source_files:
+        copy_source_file(completion_marker)
 
 
 def _install_in_place_with_backup(install_dir: Path, staging: Path, backup: Path) -> None:
