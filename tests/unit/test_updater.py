@@ -2,6 +2,7 @@ import hashlib
 import urllib.error
 import zipfile
 from argparse import Namespace
+from pathlib import Path
 
 import psutil
 import pytest
@@ -427,3 +428,143 @@ def test_stop_processes_only_targets_selected_folder(tmp_path, monkeypatch):
 
     assert selected.terminated is True
     assert untouched.terminated is False
+
+
+def test_stop_processes_closes_non_entrypoint_executable_inside_selected_folder(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+
+    class FakeProcess:
+        def __init__(self, pid, name, executable, children=()):
+            self.info = {"pid": pid, "name": name, "exe": str(executable)}
+            self.pid = pid
+            self._children = list(children)
+            self.terminated = False
+
+        def children(self, recursive=False):
+            assert recursive is True
+            return self._children
+
+        def terminate(self):
+            self.terminated = True
+
+    helper = FakeProcess(1003, "ping.exe", Path("C:/Windows/System32/ping.exe"))
+    adb = FakeProcess(1001, "adb.exe", install / "_internal" / "platform-tools" / "adb.exe", children=[helper])
+    external = FakeProcess(1002, "adb.exe", tmp_path / "other" / "adb.exe")
+    monkeypatch.setattr("updater.os.getpid", lambda: 999)
+    monkeypatch.setattr("updater.psutil.process_iter", lambda _attrs: [adb, external])
+    monkeypatch.setattr("updater.psutil.wait_procs", lambda processes, timeout: (processes, []))
+
+    stop_target_processes(install)
+
+    assert adb.terminated is True
+    assert helper.terminated is True
+    assert external.terminated is False
+
+
+def test_stop_processes_closes_external_descendant_spawned_by_aalc(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+
+    class FakeProcess:
+        def __init__(self, pid, name, executable, children=()):
+            self.info = {"pid": pid, "name": name, "exe": str(executable)}
+            self.pid = pid
+            self._children = list(children)
+            self.terminated = False
+
+        def children(self, recursive=False):
+            assert recursive is True
+            return self._children
+
+        def terminate(self):
+            self.terminated = True
+
+    terminal = FakeProcess(1002, "cmd.exe", Path("C:/Windows/System32/cmd.exe"))
+    aalc = FakeProcess(1001, ENTRYPOINT, install / ENTRYPOINT, children=[terminal])
+    monkeypatch.setattr("updater.os.getpid", lambda: 999)
+    monkeypatch.setattr("updater.psutil.process_iter", lambda _attrs: [aalc])
+    monkeypatch.setattr("updater.psutil.wait_procs", lambda processes, timeout: (processes, []))
+
+    stop_target_processes(install)
+
+    assert aalc.terminated is True
+    assert terminal.terminated is True
+
+
+def test_transactional_install_retries_transient_windows_directory_lock(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+    payload = tmp_path / "payload" / "AALC"
+    install.mkdir()
+    payload.mkdir(parents=True)
+    (install / ENTRYPOINT).write_bytes(b"old")
+    (payload / ENTRYPOINT).write_bytes(b"new")
+    original_rename = Path.rename
+    attempts = 0
+    sleeps = []
+
+    def flaky_rename(path, destination):
+        nonlocal attempts
+        if path == install and attempts < 2:
+            attempts += 1
+            raise PermissionError(5, "directory is still locked")
+        return original_rename(path, destination)
+
+    monkeypatch.setattr("updater.Path.rename", flaky_rename)
+    monkeypatch.setattr("updater.stop_target_processes", lambda _install: None)
+    monkeypatch.setattr("updater.time.sleep", sleeps.append)
+
+    backup = transactional_install(install, payload, "v1.0.2", launch=False)
+
+    assert attempts == 2
+    assert sleeps == [0.5, 1.0]
+    assert (install / ENTRYPOINT).read_bytes() == b"new"
+    assert (backup / ENTRYPOINT).read_bytes() == b"old"
+
+
+def test_transactional_install_reports_untouched_old_version_after_permanent_lock(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+    payload = tmp_path / "payload" / "AALC"
+    install.mkdir()
+    payload.mkdir(parents=True)
+    (install / ENTRYPOINT).write_bytes(b"old")
+    (payload / ENTRYPOINT).write_bytes(b"new")
+    original_rename = Path.rename
+
+    def locked_rename(path, destination):
+        if path == install:
+            raise PermissionError(5, "directory remains locked")
+        return original_rename(path, destination)
+
+    monkeypatch.setattr("updater.Path.rename", locked_rename)
+    monkeypatch.setattr("updater.stop_target_processes", lambda _install: None)
+    monkeypatch.setattr("updater.time.sleep", lambda _delay: None)
+    monkeypatch.setattr("updater._blocking_process_summary", lambda _root: "cmd.exe (PID 42：当前工作目录位于该目录)")
+
+    with pytest.raises(UpdaterError, match="旧版本未移动，原目录保持不变") as exc_info:
+        transactional_install(install, payload, "v1.0.2", launch=False)
+
+    assert "cmd.exe" in str(exc_info.value)
+    assert (install / ENTRYPOINT).read_bytes() == b"old"
+
+
+def test_transactional_install_restores_backup_when_staging_switch_fails(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+    payload = tmp_path / "payload" / "AALC"
+    install.mkdir()
+    payload.mkdir(parents=True)
+    (install / ENTRYPOINT).write_bytes(b"old")
+    (payload / ENTRYPOINT).write_bytes(b"new")
+    original_rename = Path.rename
+
+    def fail_staging_switch(path, destination):
+        if path.name.startswith(".AALC.update-staging-") and destination == install:
+            raise OSError(22, "simulated non-retryable staging failure")
+        return original_rename(path, destination)
+
+    monkeypatch.setattr("updater.Path.rename", fail_staging_switch)
+    monkeypatch.setattr("updater.stop_target_processes", lambda _install: None)
+
+    with pytest.raises(UpdaterError, match="已自动恢复旧版本"):
+        transactional_install(install, payload, "v1.0.2", launch=False)
+
+    assert (install / ENTRYPOINT).read_bytes() == b"old"
+    assert not list(tmp_path.glob("AALC.backup-*"))

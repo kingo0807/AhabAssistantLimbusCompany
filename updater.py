@@ -23,7 +23,7 @@ from typing import Any
 
 import psutil
 
-UPDATER_VERSION = "1.3.0"
+UPDATER_VERSION = "1.4.0"
 REPOSITORY = "kingo0807/AhabAssistantLimbusCompany"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 MANIFEST_ASSET_NAME = "update-manifest.json"
@@ -40,6 +40,8 @@ CREATE_NO_WINDOW = 0x08000000
 ERROR_ELEVATION_REQUIRED = 740
 SHELL_EXECUTE_SUCCESS = 32
 SW_SHOWNORMAL = 1
+DIRECTORY_SWITCH_RETRY_DELAYS = (0.5, 1.0, 2.0, 3.0, 5.0)
+RETRYABLE_DIRECTORY_WINERRORS = {5, 32, 33}
 
 
 class UpdaterError(RuntimeError):
@@ -275,22 +277,76 @@ def _same_or_child(path: Path, root: Path) -> bool:
         return False
 
 
-def stop_target_processes(install_dir: Path) -> None:
-    targets: list[psutil.Process] = []
-    current_pid = os.getpid()
-    for process in psutil.process_iter(["pid", "name", "exe"]):
-        if process.info["pid"] == current_pid or (process.info.get("name") or "").casefold() != ENTRYPOINT.casefold():
-            continue
+def _process_pid(process: psutil.Process) -> int:
+    info = getattr(process, "info", {}) or {}
+    return int(info.get("pid") or process.pid)
+
+
+def _process_executable(process: psutil.Process) -> Path | None:
+    info = getattr(process, "info", {}) or {}
+    executable = info.get("exe")
+    if not executable:
+        executable = process.exe()
+    return Path(executable) if executable else None
+
+
+def _protected_worker_pids(install_dir: Path, current_pid: int) -> set[int]:
+    """保护临时 worker 及其安装目录外的启动链，避免清理子进程时误杀自身。"""
+    protected = {current_pid}
+    try:
+        ancestors = psutil.Process(current_pid).parents()
+    except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+        return protected
+    for ancestor in ancestors:
         try:
-            executable = process.info.get("exe") or process.exe()
-            if executable and _same_or_child(Path(executable), install_dir):
-                targets.append(process)
+            executable = _process_executable(ancestor)
+            if executable is None or not _same_or_child(executable, install_dir):
+                protected.add(ancestor.pid)
         except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            protected.add(ancestor.pid)
+    return protected
+
+
+def _collect_target_processes(install_dir: Path) -> list[psutil.Process]:
+    """收集安装目录内的程序，以及由 AALC 拉起且可能继续占用目录的子进程。"""
+    current_pid = os.getpid()
+    protected = _protected_worker_pids(install_dir, current_pid)
+    targets: dict[int, psutil.Process] = {}
+    target_roots: list[psutil.Process] = []
+
+    for process in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            pid = _process_pid(process)
+            if pid in protected:
+                continue
+            executable = _process_executable(process)
+            if executable is None or not _same_or_child(executable, install_dir):
+                continue
+            targets[pid] = process
+            target_roots.append(process)
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError, ValueError):
             continue
 
+    for root in target_roots:
+        try:
+            descendants = root.children(recursive=True)
+        except (AttributeError, psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            continue
+        for child in descendants:
+            try:
+                pid = _process_pid(child)
+                if pid not in protected:
+                    targets[pid] = child
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError, ValueError):
+                continue
+    return list(targets.values())
+
+
+def stop_target_processes(install_dir: Path) -> None:
+    targets = _collect_target_processes(install_dir)
     if not targets:
         return
-    print(f"正在关闭当前目录中的 {len(targets)} 个 AALC 进程……")
+    print(f"正在关闭可能占用当前目录的 {len(targets)} 个进程……")
     for process in targets:
         try:
             process.terminate()
@@ -304,7 +360,80 @@ def stop_target_processes(install_dir: Path) -> None:
             pass
     _, alive = psutil.wait_procs(alive, timeout=5)
     if alive:
-        raise UpdaterError("AALC 仍在运行，请手动关闭当前目录中的 AALC 后重试")
+        names = []
+        for process in alive[:6]:
+            try:
+                names.append(f"{process.name()} (PID {_process_pid(process)})")
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError, ValueError):
+                names.append(f"PID {_process_pid(process)}")
+        raise UpdaterError(f"仍有进程占用 AALC 目录，请关闭后重试：{', '.join(names)}")
+
+
+def _blocking_process_summary(root: Path) -> str:
+    """只读诊断目录占用者；不自动终止与 AALC 无关的编辑器或终端。"""
+    blockers: list[str] = []
+    current_pid = os.getpid()
+    for process in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            pid = _process_pid(process)
+            if pid == current_pid:
+                continue
+            reasons: list[str] = []
+            executable = _process_executable(process)
+            if executable is not None and _same_or_child(executable, root):
+                reasons.append("程序位于该目录")
+            try:
+                cwd = Path(process.cwd())
+                if _same_or_child(cwd, root):
+                    reasons.append("当前工作目录位于该目录")
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                pass
+            try:
+                if any(_same_or_child(Path(item.path), root) for item in process.open_files()):
+                    reasons.append("打开了目录内文件")
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                pass
+            if reasons:
+                info = getattr(process, "info", {}) or {}
+                name = info.get("name") or process.name()
+                blockers.append(f"{name} (PID {pid}：{'、'.join(dict.fromkeys(reasons))})")
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError, ValueError):
+            continue
+        if len(blockers) >= 6:
+            break
+    return "；".join(blockers)
+
+
+def _retryable_directory_error(exc: OSError) -> bool:
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in RETRYABLE_DIRECTORY_WINERRORS
+
+
+def _rename_directory_with_retry(
+    source: Path,
+    destination: Path,
+    *,
+    blocker_root: Path | None = None,
+) -> None:
+    last_error: OSError | None = None
+    for attempt in range(len(DIRECTORY_SWITCH_RETRY_DELAYS) + 1):
+        try:
+            source.rename(destination)
+            return
+        except OSError as exc:
+            if not _retryable_directory_error(exc):
+                raise
+            last_error = exc
+            if attempt >= len(DIRECTORY_SWITCH_RETRY_DELAYS):
+                break
+            delay = DIRECTORY_SWITCH_RETRY_DELAYS[attempt]
+            print(f"目录仍被 Windows 占用，{delay:g} 秒后重试切换……")
+            if blocker_root is not None:
+                stop_target_processes(blocker_root)
+            time.sleep(delay)
+
+    details = _blocking_process_summary(blocker_root) if blocker_root is not None else ""
+    suffix = f"；检测到：{details}" if details else "；请关闭打开该目录的终端、编辑器或安全软件后重试"
+    raise UpdaterError(f"Windows 未能释放 AALC 目录（已重试 {len(DIRECTORY_SWITCH_RETRY_DELAYS)} 次）{suffix}") from last_error
 
 
 def launch_entrypoint(install_dir: Path) -> bool:
@@ -370,26 +499,30 @@ def transactional_install(
         _copy_preserved_data(install_dir, staging)
 
         print("正在切换版本……")
-        install_dir.rename(backup)
+        _rename_directory_with_retry(install_dir, backup, blocker_root=install_dir)
         old_moved = True
-        staging.rename(install_dir)
+        _rename_directory_with_retry(staging, install_dir)
         new_installed = True
     except Exception as exc:
+        original_restored = not old_moved
         if new_installed and install_dir.exists():
             failed = install_dir.parent / f".{install_dir.name}.failed-{uuid.uuid4().hex[:8]}"
             try:
-                install_dir.rename(failed)
+                _rename_directory_with_retry(install_dir, failed, blocker_root=install_dir)
                 shutil.rmtree(failed, ignore_errors=True)
-            except OSError:
-                pass
+                new_installed = False
+            except (OSError, UpdaterError) as cleanup_exc:
+                raise UpdaterError(
+                    f"安装失败且无法移开未完成的新版本；旧版本备份位于 {backup}：{cleanup_exc}"
+                ) from exc
         if old_moved and backup.exists() and not install_dir.exists():
             try:
-                backup.rename(install_dir)
-            except OSError as rollback_exc:
+                _rename_directory_with_retry(backup, install_dir)
+                original_restored = True
+            except (OSError, UpdaterError) as rollback_exc:
                 raise UpdaterError(f"安装失败且自动回滚失败；旧版本位于 {backup}：{rollback_exc}") from exc
-        if isinstance(exc, UpdaterError):
-            raise
-        raise UpdaterError(f"安装失败，已恢复旧版本：{exc}") from exc
+        state = "已自动恢复旧版本" if original_restored and old_moved else "旧版本未移动，原目录保持不变"
+        raise UpdaterError(f"安装失败，{state}：{exc}") from exc
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
