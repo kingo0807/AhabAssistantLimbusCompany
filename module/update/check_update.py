@@ -1,6 +1,7 @@
 import os  # 导入os模块以便操作文件路径
 import re
 import shutil
+import ssl
 import subprocess
 from enum import Enum
 from threading import Thread
@@ -11,6 +12,7 @@ from markdown_it import MarkdownIt
 from packaging.version import parse
 from PySide6.QtCore import QT_TRANSLATE_NOOP, Qt, QThread, Signal
 from qfluentwidgets import InfoBarPosition
+from requests.adapters import HTTPAdapter
 
 from app import mediator
 from app.card.messagebox_custom import BaseInfoBar, MessageBoxUpdate
@@ -20,6 +22,36 @@ from module.logger import log
 from utils.utils import decrypt_string
 
 md_renderer = MarkdownIt("gfm-like", {"html": True})
+
+
+class WindowsTrustHTTPAdapter(HTTPAdapter):
+    """让 Requests 的 HTTPS 连接同时信任 Windows 系统证书库。"""
+
+    def __init__(self, ssl_context: ssl.SSLContext, *args, **kwargs):
+        self.ssl_context = ssl_context
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        pool_kwargs["ssl_context"] = self.ssl_context
+        return super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        # 公司代理或杀毒软件做 HTTPS 检查时，其根证书通常只安装在
+        # Windows 证书库中；代理连接也必须复用同一系统信任上下文。
+        proxy_kwargs["ssl_context"] = self.ssl_context
+        proxy_kwargs["proxy_ssl_context"] = self.ssl_context
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
+def create_update_http_session() -> requests.Session:
+    """创建保持证书校验、并兼容 Windows 系统根证书的更新会话。"""
+    session = requests.Session()
+    if os.name == "nt":
+        # ssl.create_default_context() 会加载 Windows ROOT/CA 证书库。
+        # Requests 仍会保留自身 certifi CA，因此公开站点与本机受信任代理
+        # 两类证书都能校验；这里不能用 verify=False 掩盖证书错误。
+        session.mount("https://", WindowsTrustHTTPAdapter(ssl.create_default_context()))
+    return session
 
 
 class UpdateStatus(Enum):
@@ -65,6 +97,7 @@ class UpdateThread(QThread):
         self.new_version = ""
         # 记录本次检查后“当前版本是否已追平最新版本”，供资源同步门禁读取。
         self.is_current_version_latest = False
+        self.http_session = create_update_http_session()
 
     def _set_version_gate_state(self, version: str):
         """
@@ -156,13 +189,13 @@ class UpdateThread(QThread):
         最新发布版本的信息（JSON 格式）
         """
         if not cfg.update_prerelease_enable:
-            response = requests.get(
+            response = self.http_session.get(
                 f"https://api.github.com/repos/{self.user}/{self.repo}/releases/latest",
                 timeout=10,
                 headers=cfg.useragent,
             )
         else:
-            response = requests.get(
+            response = self.http_session.get(
                 f"https://api.github.com/repos/{self.user}/{self.repo}/releases",
                 timeout=10,
                 headers=cfg.useragent,
@@ -182,13 +215,13 @@ class UpdateThread(QThread):
         最新发布版本的信息（JSON 格式）
         """
         if not cfg.update_prerelease_enable:
-            response = requests.get(
+            response = self.http_session.get(
                 f"https://mirrorchyan.com/api/resources/AALC/latest?current_version={cfg.version}&user_agent={self.repo}&cdk={cdk}",
                 timeout=10,
                 headers=cfg.useragent,
             )
         else:
-            response = requests.get(
+            response = self.http_session.get(
                 f"https://mirrorchyan.com/api/resources/AALC/latest?current_version={cfg.version}&user_agent={self.repo}&channel=beta&cdk={cdk}",
                 timeout=10,
                 headers=cfg.useragent,
@@ -270,7 +303,7 @@ class UpdateThread(QThread):
                         }
                         if self.code in cdk_error_messages:
                             self.error_msg = cdk_error_messages[self.code]
-                    except:
+                    except Exception:
                         self.error_msg = "Mirror酱API请求失败"
                     self.updateSignal.emit(UpdateStatus.FAILURE)
                     return None
@@ -419,7 +452,7 @@ def is_valid_url(url):
         result = urlparse(url)
         # 检查URL是否包含必要的组成部分
         return all([result.scheme, result.netloc])
-    except:
+    except Exception:
         # 如果解析过程中出现异常，说明URL无效
         return False
 
@@ -444,24 +477,25 @@ def update(assets_url):
 
     try:
         # 第一步：仅发起一次流式下载请求，并在同一响应对象上完成大小读取与内容落盘。
-        with requests.get(assets_url, stream=True, timeout=10) as response:
-            response.raise_for_status()  # 检查 HTTP 请求是否成功
+        with create_update_http_session() as http_session:
+            with http_session.get(assets_url, stream=True, timeout=10) as response:
+                response.raise_for_status()  # 检查 HTTP 请求是否成功
 
-            # 第二步：读取总大小并准备本地临时文件路径。
-            total_size = int(response.headers.get("content-length", 0))
-            downloaded = 0
-            os.makedirs("update_temp", exist_ok=True)
-            file_path = os.path.join("update_temp", file_name)
+                # 第二步：读取总大小并准备本地临时文件路径。
+                total_size = int(response.headers.get("content-length", 0))
+                downloaded = 0
+                os.makedirs("update_temp", exist_ok=True)
+                file_path = os.path.join("update_temp", file_name)
 
-            # 第三步：边下载边写入本地文件，并在可计算百分比时同步上报下载进度。
-            with open(file_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size > 0:
-                            progress = int(downloaded / total_size * 100)
-                            mediator.update_progress.emit(progress)
+                # 第三步：边下载边写入本地文件，并在可计算百分比时同步上报下载进度。
+                with open(file_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1024):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total_size > 0:
+                                progress = int(downloaded / total_size * 100)
+                                mediator.update_progress.emit(progress)
 
         log.info("下载进度100%")
 
