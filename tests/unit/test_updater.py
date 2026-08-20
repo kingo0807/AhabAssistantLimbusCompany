@@ -444,6 +444,8 @@ def test_relaunch_worker_passes_parent_pid_and_original_folder(tmp_path, monkeyp
     install.mkdir()
     executable = install / "AALC-Update.exe"
     executable.write_bytes(b"updater")
+    archive = install / "AALC-Optimized-win64.zip"
+    archive.write_bytes(b"local package")
     workspace = tmp_path / "worker"
     workspace.mkdir()
     started = {}
@@ -465,11 +467,13 @@ def test_relaunch_worker_passes_parent_pid_and_original_folder(tmp_path, monkeyp
         force=False,
     )
 
-    relaunch_worker(args, install, None)
+    relaunch_worker(args, install, archive)
 
     command = started["command"]
     assert command[command.index("--parent-pid") + 1] == "4321"
     assert command[command.index("--install-dir") + 1] == str(install)
+    assert command[command.index("--source-archive") + 1] == str(archive.resolve())
+    assert not (workspace / archive.name).exists()
     assert started["kwargs"]["cwd"] == workspace
 
 

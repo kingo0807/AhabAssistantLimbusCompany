@@ -941,9 +941,9 @@ def relaunch_worker(args: argparse.Namespace, install_dir: Path, source_archive:
         args.api_url,
     ]
     if source_archive is not None:
-        copied_archive = workspace / source_archive.name
-        shutil.copy2(source_archive, copied_archive)
-        command.extend(["--source-archive", str(copied_archive)])
+        # Worker 已经运行在 AALC 目录之外，可以直接读取原目录中受保护的 ZIP。
+        # 不复制数百 MB 的本地包，既缩短启动时间，也避免系统盘临时空间不足。
+        command.extend(["--source-archive", str(source_archive.resolve())])
     if args.check_only:
         command.append("--check-only")
     if args.no_launch:
