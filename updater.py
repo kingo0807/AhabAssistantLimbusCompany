@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import fnmatch
 import hashlib
 import json
 import os
@@ -23,7 +24,7 @@ from typing import Any
 
 import psutil
 
-UPDATER_VERSION = "1.5.0"
+UPDATER_VERSION = "1.6.0"
 REPOSITORY = "kingo0807/AhabAssistantLimbusCompany"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 MANIFEST_ASSET_NAME = "update-manifest.json"
@@ -34,14 +35,30 @@ PACKAGE_VERSION_MEMBER = "AALC/assets/config/version.txt"
 ENTRYPOINT = "AALC.exe"
 USER_AGENT = f"AALC-Optimized-Updater/{UPDATER_VERSION}"
 PRESERVE_FILES = ("config.yaml", "theme_pack_list.yaml")
-PRESERVE_GLOBS = ("config.yaml.*", "上传AALC日志*.exe")
-PRESERVE_DIRECTORIES = ("config_backup", "logs", "pythonlogs", "theme_pack_weight", "issue_recordings")
+PRESERVE_GLOBS = (
+    "config.yaml.*",
+    "上传AALC日志*.exe",
+    "AALC-Optimized*.zip",
+)
+PRESERVE_DIRECTORIES = (
+    "config_backup",
+    "logs",
+    "pythonlogs",
+    "theme_pack_weight",
+    "issue_recordings",
+    "update_temp",
+)
+_PRESERVE_FILE_NAMES = frozenset(name.casefold() for name in PRESERVE_FILES)
+_PRESERVE_GLOB_PATTERNS = tuple(pattern.casefold() for pattern in PRESERVE_GLOBS)
+_PRESERVE_DIRECTORY_NAMES = frozenset(name.casefold() for name in PRESERVE_DIRECTORIES)
 CREATE_NEW_CONSOLE = 0x00000010
 CREATE_NO_WINDOW = 0x08000000
 ERROR_ELEVATION_REQUIRED = 740
 SHELL_EXECUTE_SUCCESS = 32
 SW_SHOWNORMAL = 1
 DIRECTORY_SWITCH_RETRY_DELAYS = (0.5, 1.0, 2.0, 3.0, 5.0)
+FILE_OPERATION_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
+DOWNLOAD_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
 RETRYABLE_DIRECTORY_WINERRORS = {5, 32, 33}
 
 
@@ -129,14 +146,17 @@ class UpdateManifest:
         return cls.from_json(payload, release_tag)
 
 
-def _request(url: str, timeout: int = 30):
+def _request(url: str, timeout: int = 30, extra_headers: dict[str, str] | None = None):
+    headers = {
+        "Accept": "application/vnd.github+json, application/octet-stream",
+        "User-Agent": USER_AGENT,
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     request = urllib.request.Request(
         url,
-        headers={
-            "Accept": "application/vnd.github+json, application/octet-stream",
-            "User-Agent": USER_AGENT,
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
+        headers=headers,
     )
     return urllib.request.urlopen(request, timeout=timeout)
 
@@ -156,29 +176,55 @@ def fetch_json(url: str) -> Any:
 def download_file(url: str, destination: Path, expected_size: int | None = None) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_suffix(destination.suffix + ".part")
-    downloaded = 0
     last_percent = -1
-    try:
-        with _request(url, timeout=60) as response, partial.open("wb") as output:
-            response_size = response.headers.get("Content-Length")
-            total = expected_size or (int(response_size) if response_size and response_size.isdigit() else None)
-            while chunk := response.read(1024 * 1024):
-                output.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    percent = min(100, downloaded * 100 // total)
-                    if percent // 5 != last_percent // 5:
-                        print(f"下载进度：{percent}%")
-                        last_percent = percent
-        if expected_size is not None and downloaded != expected_size:
-            raise UpdaterError(f"下载大小不符：应为 {expected_size}，实际为 {downloaded}")
-        os.replace(partial, destination)
-    except UpdaterError:
-        partial.unlink(missing_ok=True)
-        raise
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        partial.unlink(missing_ok=True)
-        raise UpdaterError(f"下载更新包失败：{exc}") from exc
+    last_error: BaseException | None = None
+    for attempt in range(len(DOWNLOAD_RETRY_DELAYS) + 1):
+        downloaded = partial.stat().st_size if partial.is_file() else 0
+        headers = {"Range": f"bytes={downloaded}-"} if downloaded else None
+        try:
+            with _request(url, timeout=60, extra_headers=headers) as response:
+                status = getattr(response, "status", None) or response.getcode()
+                # GitHub/镜像可能忽略 Range 并返回完整 200；此时必须从头写，
+                # 否则会把完整包追加到残包后面，直到 SHA-256 校验才发现问题。
+                if downloaded and status != 206:
+                    downloaded = 0
+                    partial.unlink(missing_ok=True)
+                response_size = response.headers.get("Content-Length")
+                body_size = int(response_size) if response_size and response_size.isdigit() else None
+                total = expected_size or (downloaded + body_size if status == 206 and body_size else body_size)
+                mode = "ab" if downloaded else "wb"
+                with partial.open(mode) as output:
+                    while chunk := response.read(1024 * 1024):
+                        output.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            percent = min(100, downloaded * 100 // total)
+                            if percent // 5 != last_percent // 5:
+                                print(f"下载进度：{percent}%")
+                                last_percent = percent
+                    output.flush()
+                    os.fsync(output.fileno())
+            if expected_size is not None and downloaded != expected_size:
+                raise UpdaterError(f"下载大小不符：应为 {expected_size}，实际为 {downloaded}")
+            _with_file_retry(lambda: os.replace(partial, destination), f"更新包 {destination.name}")
+            return
+        except UpdaterError as exc:
+            # 大小错误不可通过重试修复；保留 .part 供下一次运行续传，但不让错误包成为正式包。
+            last_error = exc
+            if "下载大小不符" not in str(exc) or attempt >= len(DOWNLOAD_RETRY_DELAYS):
+                break
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt >= len(DOWNLOAD_RETRY_DELAYS):
+                break
+        delay = DOWNLOAD_RETRY_DELAYS[attempt]
+        print(f"下载连接中断，保留已下载部分，{delay:g} 秒后从断点重试……")
+        time.sleep(delay)
+
+    message = f"下载更新包失败（已尝试 {len(DOWNLOAD_RETRY_DELAYS) + 1} 次）"
+    if partial.is_file():
+        message += f"；断点保留在 {partial}，可重新运行继续下载"
+    raise UpdaterError(f"{message}：{last_error}") from last_error
 
 
 def sha256_file(path: Path) -> str:
@@ -299,6 +345,21 @@ def _copy_preserved_data(source: Path, destination: Path) -> None:
         item = source / name
         if item.is_dir():
             shutil.copytree(item, destination / name, dirs_exist_ok=True)
+
+
+def _is_preserved_relative(relative: Path) -> bool:
+    """完整包更新时不读取、不覆盖、也不清理用户数据和本地更新工具。"""
+    if not relative.parts:
+        return False
+    top_level = relative.parts[0]
+    folded = top_level.casefold()
+    if folded in _PRESERVE_DIRECTORY_NAMES:
+        return True
+    if len(relative.parts) != 1:
+        return False
+    if folded in _PRESERVE_FILE_NAMES:
+        return True
+    return any(fnmatch.fnmatchcase(folded, pattern) for pattern in _PRESERVE_GLOB_PATTERNS)
 
 
 def _same_or_child(path: Path, root: Path) -> bool:
@@ -488,15 +549,61 @@ def _rename_directory_with_retry(
     raise UpdaterError(f"Windows 未能释放 AALC 目录（已重试 {len(DIRECTORY_SWITCH_RETRY_DELAYS)} 次）{suffix}") from last_error
 
 
+def _retryable_file_error(exc: OSError) -> bool:
+    return (
+        isinstance(exc, PermissionError)
+        or getattr(exc, "winerror", None) in RETRYABLE_DIRECTORY_WINERRORS
+        or getattr(exc, "errno", None) in {5, 13, 32, 33}
+    )
+
+
+def _with_file_retry(action, description: str) -> None:
+    """参考 ALAS：Windows 短暂占用时指数退避，且只重试明确的占用错误。"""
+    last_error: OSError | None = None
+    for attempt in range(len(FILE_OPERATION_RETRY_DELAYS) + 1):
+        try:
+            action()
+            return
+        except OSError as exc:
+            if not _retryable_file_error(exc):
+                raise
+            last_error = exc
+            if attempt >= len(FILE_OPERATION_RETRY_DELAYS):
+                break
+            delay = FILE_OPERATION_RETRY_DELAYS[attempt]
+            print(f"{description}仍被 Windows 短暂占用，{delay:g} 秒后重试……")
+            time.sleep(delay)
+    raise UpdaterError(f"{description}持续被占用，未修改更新完成标记：{last_error}") from last_error
+
+
 def _remove_tree_entry(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-    elif path.exists():
-        shutil.rmtree(path)
+    def remove() -> None:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+
+    _with_file_retry(remove, f"路径 {path.name}")
+
+
+def _copy_file_atomically(source: Path, target: Path) -> None:
+    if target.exists() and target.is_dir():
+        _remove_tree_entry(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.update-{uuid.uuid4().hex[:8]}")
+    try:
+        with source.open("rb") as input_stream, temporary.open("wb") as output_stream:
+            shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+        shutil.copystat(source, temporary)
+        _with_file_retry(lambda: os.replace(temporary, target), f"文件 {target.name}")
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _mirror_tree(source: Path, destination: Path) -> None:
-    """把 source 精确镜像到既有目录；根目录本身不改名、不删除。"""
+    """文件级事务安装；根目录和用户数据从不改名、删除或覆盖。"""
     source = source.resolve()
     destination = destination.resolve()
     if not source.is_dir() or not destination.is_dir():
@@ -506,18 +613,25 @@ def _mirror_tree(source: Path, destination: Path) -> None:
 
     source_files: set[Path] = set()
     source_directories: set[Path] = {Path()}
-    for root, directories, files in os.walk(source, followlinks=False):
+    for root, directories, files in os.walk(source, topdown=True, followlinks=False):
         root_path = Path(root)
         relative_root = root_path.relative_to(source)
+        kept_directories: list[str] = []
         for name in directories:
             item = root_path / name
             relative = relative_root / name
+            if _is_preserved_relative(relative):
+                continue
             if item.is_symlink():
                 raise UpdaterError(f"更新内容不允许目录链接：{relative}")
             source_directories.add(relative)
+            kept_directories.append(name)
+        directories[:] = kept_directories
         for name in files:
             item = root_path / name
             relative = relative_root / name
+            if _is_preserved_relative(relative):
+                continue
             if item.is_symlink():
                 raise UpdaterError(f"更新内容不允许文件链接：{relative}")
             source_files.add(relative)
@@ -532,42 +646,51 @@ def _mirror_tree(source: Path, destination: Path) -> None:
 
     completion_marker = Path(".aalc-release.json")
 
-    def copy_source_file(relative: Path) -> None:
-        source_file = source / relative
-        target = destination / relative
-        if target.exists() and target.is_dir():
-            _remove_tree_entry(target)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(f".{target.name}.update-{uuid.uuid4().hex[:8]}")
-        try:
-            shutil.copy2(source_file, temporary)
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
-
     for relative in sorted(source_files - {completion_marker}, key=lambda item: item.as_posix().casefold()):
-        copy_source_file(relative)
+        _copy_file_atomically(source / relative, destination / relative)
 
     for root, directories, files in os.walk(destination, topdown=False, followlinks=False):
         root_path = Path(root)
         relative_root = root_path.relative_to(destination)
         for name in files:
             relative = relative_root / name
+            if _is_preserved_relative(relative):
+                continue
             if relative not in source_files:
                 _remove_tree_entry(root_path / name)
         for name in directories:
             relative = relative_root / name
             target = root_path / name
-            if target.is_symlink() or relative not in source_directories:
-                _remove_tree_entry(target)
+            if _is_preserved_relative(relative):
+                continue
+            if target.is_symlink():
+                if relative not in source_directories:
+                    _remove_tree_entry(target)
+                continue
+            if relative not in source_directories:
+                try:
+                    target.rmdir()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    # 其他程序仅把空目录当作当前工作目录时，Windows 会拒绝删除；
+                    # 空目录残留不影响新版本，不能因此把已完成的文件事务判失败。
+                    try:
+                        is_empty = not any(target.iterdir())
+                    except OSError:
+                        is_empty = False
+                    if is_empty:
+                        print(f"保留暂时被占用的空旧目录：{target}")
+                    else:
+                        raise
 
     # 完成标记必须最后提交，避免外部程序在主文件尚未替换完时误判更新成功。
     if completion_marker in source_files:
-        copy_source_file(completion_marker)
+        _copy_file_atomically(source / completion_marker, destination / completion_marker)
 
 
 def _install_in_place_with_backup(install_dir: Path, staging: Path, backup: Path) -> None:
-    """目录句柄阻止根目录改名时，完整备份后在原目录内安装。"""
+    """完整备份后执行文件级事务；安装根目录始终保持原位。"""
     try:
         shutil.copytree(install_dir, backup)
     except Exception as exc:
@@ -638,9 +761,6 @@ def transactional_install(
     if backup.exists():
         backup = install_dir.parent / f"{backup.name}-{uuid.uuid4().hex[:4]}"
 
-    old_moved = False
-    new_installed = False
-    in_place_attempted = False
     try:
         print("正在准备新版本……")
         shutil.copytree(payload_root, staging)
@@ -649,42 +769,10 @@ def transactional_install(
             encoding="utf-8",
         )
         stop_target_processes(install_dir)
-        _copy_preserved_data(install_dir, staging)
 
-        print("正在切换版本……")
-        try:
-            _rename_directory_with_retry(install_dir, backup, blocker_root=install_dir)
-        except UpdaterError as switch_error:
-            in_place_attempted = True
-            print(f"整目录切换不可用，改用完整备份后的原目录兼容安装：{switch_error}")
-            _install_in_place_with_backup(install_dir, staging, backup)
-            new_installed = True
-        else:
-            old_moved = True
-            _rename_directory_with_retry(staging, install_dir)
-            new_installed = True
-    except Exception as exc:
-        if in_place_attempted and not old_moved:
-            raise UpdaterError(f"安装失败：{exc}") from exc
-        original_restored = not old_moved
-        if new_installed and install_dir.exists():
-            failed = install_dir.parent / f".{install_dir.name}.failed-{uuid.uuid4().hex[:8]}"
-            try:
-                _rename_directory_with_retry(install_dir, failed, blocker_root=install_dir)
-                shutil.rmtree(failed, ignore_errors=True)
-                new_installed = False
-            except (OSError, UpdaterError) as cleanup_exc:
-                raise UpdaterError(
-                    f"安装失败且无法移开未完成的新版本；旧版本备份位于 {backup}：{cleanup_exc}"
-                ) from exc
-        if old_moved and backup.exists() and not install_dir.exists():
-            try:
-                _rename_directory_with_retry(backup, install_dir)
-                original_restored = True
-            except (OSError, UpdaterError) as rollback_exc:
-                raise UpdaterError(f"安装失败且自动回滚失败；旧版本位于 {backup}：{rollback_exc}") from exc
-        state = "已自动恢复旧版本" if original_restored and old_moved else "旧版本未移动，原目录保持不变"
-        raise UpdaterError(f"安装失败，{state}：{exc}") from exc
+        print("正在创建完整回滚备份……")
+        print("正在执行文件级原子更新（AALC 根目录不会移动）……")
+        _install_in_place_with_backup(install_dir, staging, backup)
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
@@ -755,16 +843,26 @@ class StandaloneUpdater:
                 return None
 
         workspace = Path(tempfile.mkdtemp(prefix="AALC-update-payload-"))
+        cached_package: Path | None = None
         try:
-            package_path = workspace / manifest.asset
             if source_archive is None:
+                # 下载缓存放在当前 AALC 目录的独立子目录中，跨进程/跨次运行保留 .part，
+                # 网络中断后可从断点续传；文件级安装会跳过该目录，不会覆盖它。
+                cache_dir = self.install_dir / "update_temp"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cached_package = cache_dir / manifest.asset
+                package_path = cached_package
                 print(f"正在下载 {manifest.asset}……")
                 download_file(package_asset.url, package_path, manifest.size or package_asset.size)
             else:
-                print(f"正在验证并复制本地更新包：{source_archive}")
-                shutil.copy2(source_archive, package_path)
+                print(f"正在验证本地更新包：{source_archive}")
+                # 本地 ZIP 已由用户放在目标目录，直接读取它，避免复制 200MB+ 文件到
+                # 系统临时目录；更新镜像会跳过 AALC-Optimized*.zip，因此源包不会被删除。
+                package_path = source_archive.resolve()
             actual_hash = sha256_file(package_path)
             if actual_hash != manifest.sha256:
+                if cached_package is not None:
+                    cached_package.unlink(missing_ok=True)
                 raise UpdaterError(f"更新包 SHA-256 校验失败：{actual_hash}")
             print("SHA-256 校验通过")
 
@@ -804,12 +902,26 @@ def _resolve_legacy_archive(install_dir: Path, value: str | None) -> Path | None
 
 def find_local_archive(install_dir: Path) -> Path:
     archive = (install_dir / DEFAULT_PACKAGE_ASSET).resolve()
-    if not archive.is_file():
-        raise UpdaterError(
-            f"请先下载 {DEFAULT_PACKAGE_ASSET}，把它放到当前 AALC 文件夹后再双击 AALC-Update.exe；"
-            f"应放置在：{archive}"
-        )
-    return archive
+    if archive.is_file():
+        return archive
+
+    candidates = sorted(
+        (
+            item.resolve()
+            for item in install_dir.glob("AALC-Optimized*.zip")
+            if item.is_file() and _SAFE_ZIP_ASSET.fullmatch(item.name) is not None
+        ),
+        key=lambda item: item.name.casefold(),
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        names = "、".join(item.name for item in candidates)
+        raise UpdaterError(f"当前目录有多个更新包，无法安全判断要安装哪一个：{names}")
+    raise UpdaterError(
+        f"请先下载 {DEFAULT_PACKAGE_ASSET}，把它放到当前 AALC 文件夹后再双击 AALC-Update.exe；"
+        f"应放置在：{archive}"
+    )
 
 
 def relaunch_worker(args: argparse.Namespace, install_dir: Path, source_archive: Path | None) -> None:

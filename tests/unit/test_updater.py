@@ -1,4 +1,8 @@
 import hashlib
+import os
+import subprocess
+import sys
+import time
 import urllib.error
 import zipfile
 from argparse import Namespace
@@ -18,6 +22,7 @@ from updater import (
     extract_verified_zip,
     fetch_json,
     find_local_archive,
+    download_file,
     inspect_local_archive,
     launch_entrypoint,
     parse_release,
@@ -123,6 +128,47 @@ def test_fetch_json_classifies_http_403_as_network_error(monkeypatch):
 
     with pytest.raises(UpdateNetworkError, match="403.*rate limit exceeded"):
         fetch_json("https://api.example.invalid/releases/latest")
+
+
+def test_download_file_resumes_partial_response_after_connection_reset(tmp_path, monkeypatch):
+    destination = tmp_path / "package.zip"
+    calls = []
+
+    class Response:
+        def __init__(self, status, chunks):
+            self.status = status
+            self.headers = {"Content-Length": str(sum(len(chunk) for chunk in chunks if isinstance(chunk, bytes)))}
+            self._chunks = iter(chunks)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def getcode(self):
+            return self.status
+
+        def read(self, _size):
+            chunk = next(self._chunks)
+            if isinstance(chunk, BaseException):
+                raise chunk
+            return chunk
+
+    def fake_request(_url, timeout=60, extra_headers=None):
+        calls.append(extra_headers)
+        if len(calls) == 1:
+            return Response(200, [b"abc", urllib.error.URLError("connection reset")])
+        assert extra_headers == {"Range": "bytes=3-"}
+        return Response(206, [b"def", b""])
+
+    monkeypatch.setattr("updater._request", fake_request)
+    monkeypatch.setattr("updater.time.sleep", lambda _delay: None)
+
+    download_file("https://example.invalid/package.zip", destination, expected_size=6)
+
+    assert destination.read_bytes() == b"abcdef"
+    assert len(calls) == 2
 
 
 def test_release_api_success_does_not_use_fallback(tmp_path, monkeypatch):
@@ -239,6 +285,19 @@ def test_find_local_archive_requires_fixed_name_in_selected_folder(tmp_path):
     assert find_local_archive(install) == expected.resolve()
 
 
+def test_find_local_archive_accepts_one_versioned_package_and_rejects_ambiguity(tmp_path):
+    install = tmp_path / "AALC"
+    install.mkdir()
+    versioned = install / "AALC-Optimized-v1.6.0.zip"
+    versioned.write_bytes(b"zip")
+
+    assert find_local_archive(install) == versioned.resolve()
+
+    (install / "AALC-Optimized-v1.6.1.zip").write_bytes(b"zip")
+    with pytest.raises(UpdaterError, match="多个更新包"):
+        find_local_archive(install)
+
+
 def test_local_archive_update_never_reads_network(tmp_path, monkeypatch):
     install = tmp_path / "AALC"
     install.mkdir()
@@ -273,6 +332,7 @@ def test_transactional_install_preserves_user_data_and_keeps_backup(tmp_path, mo
     (install / "issue_recordings").mkdir()
     (install / "issue_recordings" / "failure.mp4").write_bytes(b"recording")
     (install / "上传AALC日志-v1.3.1.exe").write_bytes(b"uploader")
+    (install / "AALC-Optimized-v1.0.0.zip").write_bytes(b"local package")
     (payload / ENTRYPOINT).write_bytes(b"new")
     (payload / "config.yaml").write_text("default: true", encoding="utf-8")
     (payload / "new.txt").write_text("new", encoding="utf-8")
@@ -285,6 +345,7 @@ def test_transactional_install_preserves_user_data_and_keeps_backup(tmp_path, mo
     assert (install / "logs" / "debug.log").read_text(encoding="utf-8") == "evidence"
     assert (install / "issue_recordings" / "failure.mp4").read_bytes() == b"recording"
     assert (install / "上传AALC日志-v1.3.1.exe").read_bytes() == b"uploader"
+    assert (install / "AALC-Optimized-v1.0.0.zip").read_bytes() == b"local package"
     assert (install / ".aalc-release.json").is_file()
     assert (backup / ENTRYPOINT).read_bytes() == b"old"
 
@@ -579,7 +640,7 @@ def test_stop_processes_reports_elevated_process_when_wait_access_is_denied(tmp_
         stop_target_processes(install)
 
 
-def test_transactional_install_retries_transient_windows_directory_lock(tmp_path, monkeypatch):
+def test_transactional_install_never_renames_locked_root_directory(tmp_path, monkeypatch):
     install = tmp_path / "AALC"
     payload = tmp_path / "payload" / "AALC"
     install.mkdir()
@@ -590,23 +651,73 @@ def test_transactional_install_retries_transient_windows_directory_lock(tmp_path
     attempts = 0
     sleeps = []
 
-    def flaky_rename(path, destination):
+    def locked_rename(path, destination):
         nonlocal attempts
-        if path == install and attempts < 2:
+        if path == install:
             attempts += 1
             raise PermissionError(5, "directory is still locked")
         return original_rename(path, destination)
 
-    monkeypatch.setattr("updater.Path.rename", flaky_rename)
+    monkeypatch.setattr("updater.Path.rename", locked_rename)
     monkeypatch.setattr("updater.stop_target_processes", lambda _install: None)
     monkeypatch.setattr("updater.time.sleep", sleeps.append)
 
     backup = transactional_install(install, payload, "v1.0.2", launch=False)
 
-    assert attempts == 2
-    assert sleeps == [0.5, 1.0]
+    assert attempts == 0
+    assert sleeps == []
     assert (install / ENTRYPOINT).read_bytes() == b"new"
     assert (backup / ENTRYPOINT).read_bytes() == b"old"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 目录句柄行为测试")
+def test_transactional_install_succeeds_while_external_terminal_holds_root_cwd(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+    payload = tmp_path / "payload" / "AALC"
+    install.mkdir()
+    payload.mkdir(parents=True)
+    (install / ENTRYPOINT).write_bytes(b"old")
+    (payload / ENTRYPOINT).write_bytes(b"new")
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=install)
+    monkeypatch.setattr("updater.stop_target_processes", lambda _install: None)
+    try:
+        time.sleep(0.1)
+        backup = transactional_install(install, payload, "v1.0.2", launch=False)
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+    assert (install / ENTRYPOINT).read_bytes() == b"new"
+    assert (backup / ENTRYPOINT).read_bytes() == b"old"
+
+
+def test_transactional_install_retries_transient_file_lock(tmp_path, monkeypatch):
+    install = tmp_path / "AALC"
+    payload = tmp_path / "payload" / "AALC"
+    install.mkdir()
+    payload.mkdir(parents=True)
+    (install / ENTRYPOINT).write_bytes(b"old")
+    (payload / ENTRYPOINT).write_bytes(b"new")
+    real_replace = __import__("updater").os.replace
+    attempts = 0
+    sleeps = []
+
+    def flaky_replace(source, destination):
+        nonlocal attempts
+        if Path(destination) == install / ENTRYPOINT and attempts < 2:
+            attempts += 1
+            raise PermissionError(5, "file is briefly scanned")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr("updater.os.replace", flaky_replace)
+    monkeypatch.setattr("updater.stop_target_processes", lambda _install: None)
+    monkeypatch.setattr("updater.time.sleep", sleeps.append)
+
+    transactional_install(install, payload, "v1.0.2", launch=False)
+
+    assert attempts == 2
+    assert sleeps == [0.05, 0.1]
+    assert (install / ENTRYPOINT).read_bytes() == b"new"
 
 
 def test_transactional_install_falls_back_to_in_place_mirror_after_permanent_lock(tmp_path, monkeypatch):
@@ -705,7 +816,7 @@ def test_in_place_mirror_writes_release_marker_last(tmp_path, monkeypatch):
     assert (destination / ENTRYPOINT).read_bytes() == b"new"
 
 
-def test_transactional_install_restores_backup_when_staging_switch_fails(tmp_path, monkeypatch):
+def test_transactional_install_does_not_switch_staging_directory(tmp_path, monkeypatch):
     install = tmp_path / "AALC"
     payload = tmp_path / "payload" / "AALC"
     install.mkdir()
@@ -722,8 +833,7 @@ def test_transactional_install_restores_backup_when_staging_switch_fails(tmp_pat
     monkeypatch.setattr("updater.Path.rename", fail_staging_switch)
     monkeypatch.setattr("updater.stop_target_processes", lambda _install: None)
 
-    with pytest.raises(UpdaterError, match="已自动恢复旧版本"):
-        transactional_install(install, payload, "v1.0.2", launch=False)
+    backup = transactional_install(install, payload, "v1.0.2", launch=False)
 
-    assert (install / ENTRYPOINT).read_bytes() == b"old"
-    assert not list(tmp_path.glob("AALC.backup-*"))
+    assert (install / ENTRYPOINT).read_bytes() == b"new"
+    assert (backup / ENTRYPOINT).read_bytes() == b"old"
