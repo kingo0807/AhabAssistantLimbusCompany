@@ -1,4 +1,4 @@
-from tasks.mirror.search_road import Position, RouteGraph, all_node_weight
+from tasks.mirror.search_road import Row, RouteGraph, all_node_weight
 
 
 def test_route_weights_are_time_oriented_and_preserve_battle_severity() -> None:
@@ -10,19 +10,25 @@ def test_route_weights_are_time_oriented_and_preserve_battle_severity() -> None:
     assert all_node_weight["risky_encounter"] == 9
 
 
-def test_road_x_mapping_connects_the_actual_later_layers() -> None:
+def test_connections_are_applied_to_their_actual_later_columns() -> None:
     graph = RouteGraph(
         [
             [["event", (300, 560)]],
             [["event", (600, 560)]],
             [["boss_battle", (900, 300)]],
         ],
-        initial_bus_pos=Position.MID,
-        hard_mode=True,
+        bus_row=Row.MID,
+        bus_position=(100, 560),
+        hard_mode=False,
     )
 
-    # 第一、二段均为直路；只检测到第三段斜线时，不应把它错配给第一段。
-    graph.init_road([[['UP', (750, 430)]]], bus_x=100, bus_y=560)
+    graph.init_road(
+        [
+            (1, Row.MID, Row.MID),
+            (2, Row.MID, Row.MID),
+            (3, Row.MID, Row.TOP),
+        ]
+    )
 
     weight, path = graph.find_min_weight_route()
 
@@ -37,10 +43,17 @@ def test_internal_boss_misclassification_is_not_used_as_terminal() -> None:
             [["battle", (600, 560)]],
             [["boss_battle", (900, 560)]],
         ],
-        initial_bus_pos=Position.MID,
-        hard_mode=True,
+        bus_row=Row.MID,
+        bus_position=(100, 560),
+        hard_mode=False,
     )
-    graph.init_road([], bus_x=100, bus_y=560)
+    graph.init_road(
+        [
+            (1, Row.MID, Row.MID),
+            (2, Row.MID, Row.MID),
+            (3, Row.MID, Row.MID),
+        ]
+    )
 
     _, path = graph.find_min_weight_route()
 

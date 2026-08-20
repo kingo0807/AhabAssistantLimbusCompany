@@ -151,18 +151,18 @@ def test_screenshot_call_can_use_a_short_local_interval_without_changing_config(
 def test_successful_input_marks_the_current_frame_dirty():
     instance = _make_automation(Image.fromarray(np.zeros((4, 4), dtype=np.uint8)))
     instance._frame_dirty = False
-    wrapped = instance._mark_frame_dirty_after(lambda: True)
+    instance.input_handler = SimpleNamespace(action=lambda: True)
 
-    assert wrapped() is True
+    assert instance._run_input_and_mark_frame_dirty("action") is True
     assert not instance.can_reuse_current_frame()
 
 
 def test_failed_input_does_not_invalidate_the_current_frame():
     instance = _make_automation(Image.fromarray(np.zeros((4, 4), dtype=np.uint8)))
     instance._frame_dirty = False
-    wrapped = instance._mark_frame_dirty_after(lambda: False)
+    instance.input_handler = SimpleNamespace(action=lambda: False)
 
-    assert wrapped() is False
+    assert instance._run_input_and_mark_frame_dirty("action") is False
     assert instance.can_reuse_current_frame()
 
 

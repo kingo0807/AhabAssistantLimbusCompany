@@ -270,6 +270,9 @@ def test_transactional_install_preserves_user_data_and_keeps_backup(tmp_path, mo
     (install / "config.yaml").write_text("user: true", encoding="utf-8")
     (install / "logs").mkdir()
     (install / "logs" / "debug.log").write_text("evidence", encoding="utf-8")
+    (install / "issue_recordings").mkdir()
+    (install / "issue_recordings" / "failure.mp4").write_bytes(b"recording")
+    (install / "上传AALC日志-v1.3.1.exe").write_bytes(b"uploader")
     (payload / ENTRYPOINT).write_bytes(b"new")
     (payload / "config.yaml").write_text("default: true", encoding="utf-8")
     (payload / "new.txt").write_text("new", encoding="utf-8")
@@ -280,6 +283,8 @@ def test_transactional_install_preserves_user_data_and_keeps_backup(tmp_path, mo
     assert (install / ENTRYPOINT).read_bytes() == b"new"
     assert (install / "config.yaml").read_text(encoding="utf-8") == "user: true"
     assert (install / "logs" / "debug.log").read_text(encoding="utf-8") == "evidence"
+    assert (install / "issue_recordings" / "failure.mp4").read_bytes() == b"recording"
+    assert (install / "上传AALC日志-v1.3.1.exe").read_bytes() == b"uploader"
     assert (install / ".aalc-release.json").is_file()
     assert (backup / ENTRYPOINT).read_bytes() == b"old"
 

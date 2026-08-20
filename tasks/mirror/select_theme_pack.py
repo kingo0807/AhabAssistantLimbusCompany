@@ -82,6 +82,8 @@ def select_theme_pack(hard_switch=False, floor=None, team_num=None, use_custom_t
         theme_pack_list_en = theme_list.get_effective_theme_pack_list(
             hard_switch, "en", team_num, use_custom_theme_pack_weight
         )
+    # 新卡包尚未收录或 OCR 未命中时，使用用户可配置的「未知 / unknown」权重。
+    unknown_weight = int(theme_pack_list_zh.get("未知", theme_pack_list_en.get("unknown", -5)))
     refresh_times = 3
     difficulty = None
     if auto.find_element("mirror/road_in_mir/legend_assets.png", take_screenshot=True):
@@ -188,7 +190,7 @@ def select_theme_pack(hard_switch=False, floor=None, team_num=None, use_custom_t
                         theme_pack_weight = result.value
                         theme_pack_name = result.text
                     else:
-                        theme_pack_weight = -5
+                        theme_pack_weight = unknown_weight
                         theme_pack_name = "unknown"
 
                     weight_list.append(theme_pack_weight)  # 采用最大值的形式，权重越大，优先级越高

@@ -28,6 +28,17 @@ DEFAULT_TEMP_DIR = Path("update_temp")
 # 网络请求超时时间，单位为秒。
 DEFAULT_REQUEST_TIMEOUT = 10
 
+# 资源仓库曾先于程序代码删除这些模板，导致同步后镜牢楼层识别永久重试。
+# 在代码彻底移除对应引用前，只阻止删除；若远端重新发布，仍允许正常更新。
+PROTECTED_LOCAL_IMAGE_PATHS = frozenset(
+    {
+        "dark/share/mirror/road_in_mir/not_passed_floor.png",
+        "default/share/mirror/road_in_mir/focused_encounter.png",
+        "default/share/mirror/road_in_mir/not_passed_floor.png",
+        "default/share/mirror/road_in_mir/risky_encounter.png",
+    }
+)
+
 
 class ResourceCheckStatus(Enum):
     """资源更新检查阶段的状态枚举。"""
@@ -460,8 +471,13 @@ class ResourceSyncService:
             if sha256_file(local_path) != entry.sha256:
                 plan.files_to_update.append(entry)
 
-        # 第三步：本地只要存在“远端清单未记录”的图片，就统一记录为待删除文件。
-        plan.files_to_delete = sorted(relative_path for relative_path in local_files if relative_path not in remote_entries)
+        # 第三步：清理普通的本地多余图片，但保留当前程序仍会读取的兼容模板。
+        # 这只影响删除；受保护路径若重新进入远端清单，仍会在上面的比较中正常更新。
+        plan.files_to_delete = sorted(
+            relative_path
+            for relative_path in local_files
+            if relative_path not in remote_entries and relative_path not in PROTECTED_LOCAL_IMAGE_PATHS
+        )
 
         # 第四步：输出汇总日志，方便右侧日志栏和问题排查复用。
         log.debug(
