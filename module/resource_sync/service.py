@@ -33,9 +33,12 @@ DEFAULT_REQUEST_TIMEOUT = 10
 PROTECTED_LOCAL_IMAGE_PATHS = frozenset(
     {
         "dark/share/mirror/road_in_mir/not_passed_floor.png",
+        "default/share/mirror/road_in_mir/down.png",
         "default/share/mirror/road_in_mir/focused_encounter.png",
+        "default/share/mirror/road_in_mir/mid.png",
         "default/share/mirror/road_in_mir/not_passed_floor.png",
         "default/share/mirror/road_in_mir/risky_encounter.png",
+        "default/share/mirror/road_in_mir/up.png",
     }
 )
 

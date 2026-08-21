@@ -2,6 +2,14 @@ from module.resource_sync.manifest import ResourceManifest
 from module.resource_sync.service import PROTECTED_LOCAL_IMAGE_PATHS, ResourceSyncService
 
 
+def test_route_templates_removed_from_remote_manifest_remain_protected():
+    assert {
+        "default/share/mirror/road_in_mir/up.png",
+        "default/share/mirror/road_in_mir/mid.png",
+        "default/share/mirror/road_in_mir/down.png",
+    }.issubset(PROTECTED_LOCAL_IMAGE_PATHS)
+
+
 def test_sync_plan_keeps_images_still_referenced_by_program(tmp_path):
     assets_dir = tmp_path / "images"
     for relative_path in PROTECTED_LOCAL_IMAGE_PATHS:
