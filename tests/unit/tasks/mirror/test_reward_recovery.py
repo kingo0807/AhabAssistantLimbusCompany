@@ -38,6 +38,22 @@ class _LoadingAuto:
         return (100, 100) if path == self.visible_asset else None
 
 
+class _ReturnedToDriveAuto:
+    def __init__(self):
+        self.model = None
+        self.find_calls = []
+
+    @staticmethod
+    def take_screenshot():
+        return object()
+
+    def find_element(self, path, **kwargs):
+        self.find_calls.append((path, kwargs))
+        if path == "home/mirror_dungeons_assets.png":
+            return (676, 481)
+        return None
+
+
 def _handler():
     return object.__new__(mirror_module.Mirror)
 
@@ -141,6 +157,20 @@ def test_reward_loading_accepts_second_asset_and_resets_when_absent(monkeypatch)
 
     fake_auto.visible_asset = None
     assert _handler()._reward_loading_state(20.0) == (False, None, False)
+
+
+def test_reward_wait_accepts_drive_menu_after_claim_confirmation(monkeypatch):
+    fake_auto = _ReturnedToDriveAuto()
+    monkeypatch.setattr(mirror_module, "auto", fake_auto)
+
+    assert _handler().get_reward_in_road() is True
+    assert fake_auto.find_calls == [
+        ("home/drive_assets.png", {}),
+        (
+            "home/mirror_dungeons_assets.png",
+            {"threshold": 0.9, "model": "normal"},
+        ),
+    ]
 
 
 def test_reward_progress_watchdog_only_resets_when_stage_changes(monkeypatch):

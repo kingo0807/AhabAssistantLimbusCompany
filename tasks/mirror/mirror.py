@@ -1732,7 +1732,11 @@ class Mirror:
             if auto.take_screenshot() is None:
                 auto.mouse_to_blank()
                 continue
-            if auto.find_element("home/drive_assets.png"):
+            if auto.find_element("home/drive_assets.png") or auto.find_element(
+                "home/mirror_dungeons_assets.png",
+                threshold=0.9,
+                model="normal",
+            ):
                 return True
 
             is_loading, reward_loading_started_at, loading_timed_out = self._reward_loading_state(
