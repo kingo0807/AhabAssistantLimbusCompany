@@ -63,7 +63,7 @@ set_after_completion_options = {
     QT_TRANSLATE_NOOP("BaseComboBox", "退出MUMU模拟器"): 7,
     QT_TRANSLATE_NOOP("BaseComboBox", "退出AALC和MUMU模拟器"): 8,
 }
-all_teams = {f"Team{i}": i for i in range(1, 21)}
+all_teams = {f"Team{i}": i for i in range(1, 41)}
 coutinuous_times = {f"{i} Times": i for i in range(1, 11)}
 all_systems = {
     QT_TRANSLATE_NOOP("BaseComboBox", "烧伤"): 0,
@@ -128,6 +128,11 @@ refresh_count_options = {
     "5": 5,
 }
 
+mirror_floor_options = {
+    QT_TRANSLATE_NOOP("BaseComboBox", "不进入"): 0,
+    **{str(i): i for i in range(1, 6)},
+}
+
 blank_team_setting = {}
 
 
@@ -182,6 +187,7 @@ all_combobox_config_name = [
     "skill_replacement_mode",
     "max_keyword_refresh",
     "max_normal_refresh",
+    "normal_to_hard_floor",
 ]
 
 all_checkbox_config_name = [
