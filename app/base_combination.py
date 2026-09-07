@@ -58,16 +58,16 @@ from app.card.messagebox_custom import (
     MessageBoxSpinbox,
 )
 from app.language_manager import LanguageManager
-from module.font_manager import font_manager
-from module.logger import log
-from module.my_error.my_error import settingsTypeError
-from module.update.check_update import check_update
 from app.observe_ego_gift_selection import (
     OBSERVE_COL_VALUES,
     OBSERVE_LEVEL_VALUES,
     OBSERVE_ROW_VALUES,
     ObserveGiftSelection,
 )
+from module.font_manager import font_manager
+from module.logger import log
+from module.my_error.my_error import settingsTypeError
+from module.update.check_update import check_update
 from utils.utils import decrypt_string, encrypt_string
 
 
@@ -97,6 +97,7 @@ class CheckBoxWithButton(QFrame):
 
     def retranslateUi(self):
         self.box.check_box.setText(self.tr(self.box_text))
+
 
 class CheckBoxWithComboBox(QFrame):
     def __init__(
@@ -937,6 +938,47 @@ class PushSettingCardChance(BasePushSettingCard):
                 self.on_confirm(new_value)
 
 
+class PushSettingCardText(BasePushSettingCard):
+    def __init__(
+        self,
+        text,
+        icon: Union[str, QIcon, FluentIconBase],
+        title,
+        config_name: str,
+        content=None,
+        validator: Callable[[str], str] | None = None,
+        parent=None,
+    ):
+        super().__init__(text, icon, title, content, parent)
+        self.config_name = config_name
+        self.validator = validator
+        self.line_text = LineEdit()
+        self.line_text.setAlignment(Qt.AlignCenter)
+        self.line_text.setReadOnly(True)
+        self.line_text.setMaximumWidth(180)
+        self.line_text.setText(str(cfg.get_value(self.config_name)))
+        current_count = self.hBoxLayout.count()
+        self.hBoxLayout.insertWidget(current_count - 2, self.line_text)
+        self.button.clicked.connect(self.__onclicked)
+
+    def __onclicked(self):
+        current_value = str(cfg.get_value(self.config_name, ""))
+        message_box = MessageBoxEdit(self.tr(self.title), current_value, self.window())
+        if not message_box.exec():
+            return
+
+        new_value = message_box.getText().strip()
+        try:
+            if self.validator is not None:
+                new_value = self.validator(new_value)
+        except ValueError as exc:
+            MessageBox(self.tr("配置无效"), str(exc), self.window()).exec()
+            return
+
+        cfg.set_value(self.config_name, new_value)
+        self.line_text.setText(new_value)
+
+
 class AutoDailyView(FlyoutViewBase):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1550,8 +1592,6 @@ class TextProgressBar(ProgressBar):
         return int((self.value() - self.minimum()) * 100 / (self.maximum() - self.minimum()))
 
 
-
-
 class ObserveGiftSelectionRow(QFrame):
     selectionChanged = Signal(int, object)
     removeRequested = Signal(int)
@@ -1568,10 +1608,10 @@ class ObserveGiftSelectionRow(QFrame):
         self.layout_.setSpacing(18)
         self.layout_.setAlignment(Qt.AlignLeft)
 
-        self.system_label = QLabel()
-        self.level_label = QLabel()
-        self.row_label = QLabel()
-        self.col_label = QLabel()
+        self.system_label = BodyLabel()
+        self.level_label = BodyLabel()
+        self.row_label = BodyLabel()
+        self.col_label = BodyLabel()
 
         self.system_combo = ComboBox(self)
         self.level_combo = ComboBox(self)

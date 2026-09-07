@@ -5,7 +5,10 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from functools import partial
 from time import sleep
 
@@ -19,6 +22,7 @@ from module.my_error.my_error import userStopError
 from utils.utils import run_as_user
 
 from .. import AbstractInput
+from ..scroll_swipe import build_scroll_swipe_plan
 from . import insert_swipe
 
 usual_key_code = {
@@ -71,6 +75,11 @@ usual_key_code = {
     "alt": 56,
 }
 
+MUMU_TEAM_SCROLL_ESCAPE_DISTANCE_AT_1080P = 60
+MUMU_TEAM_SCROLL_ESCAPE_HOLD_DURATION = 0.1
+MUMU_TEAM_SCROLL_SETTLE_DURATION = 0.5
+MUMU_TEAM_SCROLL_SETTLE_STEP_DURATION = 0.05
+
 
 class NemuIpcIncompatible(Exception):
     pass
@@ -98,6 +107,7 @@ class CaptureStd:
     def __init__(self):
         self.stdout = b""
         self.stderr = b""
+        self._capture_enabled = False
 
     def _redirect_stdout(self, to):
         sys.stdout.close()
@@ -110,8 +120,14 @@ class CaptureStd:
         sys.stderr = os.fdopen(self.fderr, "w")
 
     def __enter__(self):
-        self.fdout = sys.stdout.fileno()
-        self.fderr = sys.stderr.fileno()
+        try:
+            self.fdout = sys.stdout.fileno()
+            self.fderr = sys.stderr.fileno()
+        except (AttributeError, OSError, ValueError):
+            # PyInstaller GUI builds can provide no standard streams.
+            return self
+
+        self._capture_enabled = True
         self.reader_out, self.writer_out = os.pipe()
         self.reader_err, self.writer_err = os.pipe()
         self.old_stdout = os.dup(self.fdout)
@@ -124,6 +140,9 @@ class CaptureStd:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self._capture_enabled:
+            return
+
         self._redirect_stdout(to=self.old_stdout)
         self._redirect_stderr(to=self.old_stderr)
         os.close(self.old_stdout)
@@ -133,6 +152,7 @@ class CaptureStd:
         self.stderr = self.recvall(self.reader_err)
         os.close(self.reader_out)
         os.close(self.reader_err)
+        self._capture_enabled = False
 
     @staticmethod
     def recvall(reader, length=1024) -> bytes:
@@ -211,6 +231,11 @@ class CaptureNemuIpc(CaptureStd):
 
 class MumuControl(AbstractInput):
     connection_device = None
+    _SUPPORTED_DLL_VERSIONS = ("12.0", "15.0")
+    _NEMU_CONNECT_RETRY_THRESHOLD = 3
+
+    # 截图在途超过该时长视为卡死（正常截图远小于此值），届时弃用旧调用链并换新重试
+    _SCREENSHOT_STUCK_DEADLINE = 10.0
 
     @staticmethod
     def clean_connect():
@@ -231,6 +256,14 @@ class MumuControl(AbstractInput):
 
         self.lib = None
         self._ev = asyncio.new_event_loop()
+        self._ev_lock = threading.RLock()
+        self._dll_version = None
+        self._loaded_dll_version = None
+        self._nemu_connect_failures = 0
+        self._screenshot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="AALC-MuMuCapture")
+        self._screenshot_state_lock = threading.Lock()
+        self._pending_screenshot = None
+        self._screenshot_pending_since = 0.0
         self.display_id = display_id
 
         self.connect_id: int = 0
@@ -463,7 +496,13 @@ class MumuControl(AbstractInput):
             self.connect()
         except userStopError:
             raise
+        except NemuIpcError as e:
+            self._record_nemu_connect_failure()
+            log.warning(f"start: 启动过程异常 ({type(e).__name__}: {e}), 触发 fallback 重试")
+            self.mumu_control_api_backend()
+            self.start()
         except Exception as e:
+            self._nemu_connect_failures = 0
             log.warning(f"start: 启动过程异常 ({type(e).__name__}: {e}), 触发 fallback 重试")
             self.mumu_control_api_backend()
             self.start()
@@ -487,7 +526,8 @@ class MumuControl(AbstractInput):
                 str(self.multi_instance_number),
                 "shutdown",
             ]
-            subprocess.run(command)
+            no_window_flag = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000
+            subprocess.run(command, creationflags=no_window_flag)
             log.debug(f"MUMU模拟器编号{self.multi_instance_number}关闭完成")
         except userStopError:
             raise
@@ -676,29 +716,72 @@ class MumuControl(AbstractInput):
             log.warning(f"get_launch_status: 解析 info 失败，无法获取启动状态，stdout={proc.stdout}")
             return "not_launched"
 
-    def load_dll(self):
+    @staticmethod
+    def _alternate_dll_version(version):
+        if version == "15.0":
+            return "12.0"
+        return "15.0"
+
+    def _record_nemu_connect_failure(self):
+        self._nemu_connect_failures += 1
+        if self._nemu_connect_failures < self._NEMU_CONNECT_RETRY_THRESHOLD:
+            return
+
+        current_version = self._loaded_dll_version or self._dll_version or "12.0"
+        next_version = self._alternate_dll_version(current_version)
+        self._dll_version = next_version
+        self._nemu_connect_failures = 0
+        log.warning(
+            f"连续 {self._NEMU_CONNECT_RETRY_THRESHOLD} 次 Nemu IPC 连接失败，"
+            f"切换 DLL 版本: {current_version} -> {next_version}"
+        )
+
+    def load_dll(self, preferred_version=None):
         nemu_folder = os.path.dirname(self.install_path)
-        version = "15.0" if self.get_android_version() == "15.0" else "12.0"
-        list_dll = [
-            os.path.abspath(os.path.join(nemu_folder, "./shell/sdk/external_renderer_ipc.dll")),
-            os.path.abspath(os.path.join(nemu_folder, f"./nx_device/{version}/shell/sdk/external_renderer_ipc.dll")),
-        ]
+        version = preferred_version or self._dll_version
+        if version not in self._SUPPORTED_DLL_VERSIONS:
+            version = "15.0" if self.get_android_version() == "15.0" else "12.0"
+        self._dll_version = version
+
+        candidate_paths = []
+        seen_paths = set()
+
+        def add_candidate(path, candidate_version=None):
+            normalized_path = os.path.abspath(path)
+            if normalized_path not in seen_paths:
+                seen_paths.add(normalized_path)
+                candidate_paths.append((normalized_path, candidate_version))
+
+        # Try both versioned DLLs before the legacy unversioned paths so a fallback
+        # really tests the alternate Android version first.
+        for candidate_version in (version, self._alternate_dll_version(version)):
+            add_candidate(
+                os.path.join(nemu_folder, f"./nx_device/{candidate_version}/shell/sdk/external_renderer_ipc.dll"),
+                candidate_version,
+            )
+
+        add_candidate(os.path.join(nemu_folder, "./shell/sdk/external_renderer_ipc.dll"))
         lib_path = self.get_nemu_client_path(version)
         if lib_path:
-            list_dll.append(os.path.abspath(lib_path))
+            add_candidate(lib_path)
         nx_device_root = os.path.join(nemu_folder, "nx_device")
         if os.path.isdir(nx_device_root):
             for entry in sorted(os.listdir(nx_device_root)):
                 candidate = os.path.join(nx_device_root, entry, "shell", "sdk", "external_renderer_ipc.dll")
-                if os.path.exists(candidate):
-                    list_dll.append(os.path.abspath(candidate))
-        list_dll = list(dict.fromkeys(list_dll))
+                if entry in self._SUPPORTED_DLL_VERSIONS:
+                    add_candidate(candidate, entry)
+                else:
+                    add_candidate(candidate)
+
+        self.lib = None
+        self._loaded_dll_version = None
         ipc_dll = ""
-        for ipc_dll in list_dll:
+        for ipc_dll, candidate_version in candidate_paths:
             if not os.path.exists(ipc_dll):
                 continue
             try:
                 self.lib = ctypes.CDLL(ipc_dll)
+                self._loaded_dll_version = candidate_version or version
                 break
             except OSError as e:
                 log.error(e.__str__())
@@ -710,7 +793,7 @@ class MumuControl(AbstractInput):
         if not self.lib:
             log.error("NemuIpc 需要 MuMu12 版本 >= 3.8.13，请检查您的版本。")
             log.error("以下路径均不存在")
-            for path in list_dll:
+            for path, _ in candidate_paths:
                 log.error(f"{path}")
             raise NemuIpcIncompatible("请在AALC设置中检查您的MuMu模拟器12版本和安装路径。")
         else:
@@ -727,6 +810,7 @@ class MumuControl(AbstractInput):
             raise NemuIpcError("连接失败，请检查nemu_folder是否正确，模拟器是否正在运行")
 
         self.connect_id = connect_id
+        self._nemu_connect_failures = 0
 
         MumuControl.connection_device = self
 
@@ -757,8 +841,7 @@ class MumuControl(AbstractInput):
             asyncio.TimeoutError: If function call timeout
         """
         func_wrapped = partial(func, *args, **kwargs)
-        # Increased timeout for slow PCs
-        # Default screenshot interval is 0.2s, so a 0.15s timeout would have a fast retry without extra time costs
+        # 原生 IPC 超时后执行器线程不会立即停止；调用方应给它足够时间完成，避免并发堆积。
         result = await asyncio.wait_for(self._ev.run_in_executor(None, func_wrapped), timeout=timeout)
         return result
 
@@ -774,22 +857,25 @@ class MumuControl(AbstractInput):
             NemuIpcIncompatible:
             NemuIpcError
         """
-        result = self._ev.run_until_complete(self.ev_run_async(func, *args, **kwargs))
+        # 输入等 NemuIpc 调用共用同一个 asyncio 事件循环，必须在最底层串行化，
+        # 避免并发 run_until_complete；截图同样经本锁与其他调用互斥。
+        with self._ev_lock:
+            result = self._ev.run_until_complete(self.ev_run_async(func, *args, **kwargs))
 
-        err = False
-        if func.__name__ == "nemu_connect":
-            if result == 0:
-                err = True
-        else:
-            if result > 0:
-                err = True
-        # Get to actual error message printed in std
-        if err:
-            log.warning(f"调用 {func.__name__} 失败，结果={result}")
-            with CaptureNemuIpc(log):
-                result = self._ev.run_until_complete(self.ev_run_async(func, *args, **kwargs))
+            err = False
+            if func.__name__ == "nemu_connect":
+                if result == 0:
+                    err = True
+            else:
+                if result > 0:
+                    err = True
+            # Get to actual error message printed in std
+            if err:
+                log.warning(f"调用 {func.__name__} 失败，结果={result}")
+                with CaptureNemuIpc(log):
+                    result = self._ev.run_until_complete(self.ev_run_async(func, *args, **kwargs))
 
-        return result
+            return result
 
     def get_resolution(self):
         """
@@ -824,41 +910,105 @@ class MumuControl(AbstractInput):
                 auto.clear_img_cache()
                 log.debug(f"自动将AALC识别的分辨率适配模拟器设置: {self.width} x {self.height}")
 
-    def screenshot(self, timeout=0.15):
+    def _get_screenshot_executor(self):
+        executor = getattr(self, "_screenshot_executor", None)
+        if executor is None:
+            executor = self._screenshot_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="AALC-MuMuCapture",
+            )
+        return executor
+
+    def _swap_stuck_capture_state(self):
+        """弃用疑似卡死的截图调用链：换执行器与全局IPC锁，让后续调用立即重新尝试。
+
+        卡死的旧线程会永久泄漏并持有旧锁；进程退出时 concurrent.futures 会对工作线程
+        无超时 join，若 DLL 调用持续不返回，只能杀掉 MuMu 进程使其返回。
+        """
+        self._screenshot_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="AALC-MuMuCapture",
+        )
+        self._ev_lock = threading.RLock()
+        log.warning("MuMu截图疑似卡死，已更换执行器与IPC锁，后续截图将重新尝试")
+
+    def _swap_stuck_capture_state_if_needed(self):
+        """在途截图超过卡死阈值则换血。必须先于 connect()/get_resolution() 调用，
+        否则这些 ev_run_sync 调用会堵在被卡死线程持有的旧锁上，永远到不了换血逻辑。
+        """
+        with self._screenshot_state_lock:
+            future = self._pending_screenshot
+            if (
+                future is not None
+                and time.monotonic() - self._screenshot_pending_since > self._SCREENSHOT_STUCK_DEADLINE
+            ):
+                self._swap_stuck_capture_state()
+                self._pending_screenshot = None
+
+    def _capture_display(self):
+        """在专用单线程执行器内完成一次原生截图，并与其他 NemuIpc 调用串行。"""
+        width = self.width
+        height = self.height
+        width_ptr = ctypes.pointer(ctypes.c_int(width))
+        height_ptr = ctypes.pointer(ctypes.c_int(height))
+        length = width * height * 4
+        pixels_pointer = ctypes.pointer((ctypes.c_ubyte * length)())
+
+        # wait_for 超时不会停止正在执行的 ctypes 调用；工作线程必须在调用结束前
+        # 持有全局 IPC 锁，避免截图与输入操作同时进入 MuMu DLL。
+        with self._ev_lock:
+            ret = self.lib.nemu_capture_display(
+                self.connect_id,
+                self.display_id,
+                length,
+                width_ptr,
+                height_ptr,
+                pixels_pointer,
+            )
+        if ret > 0:
+            raise NemuIpcError("nemu_capture_display failed during screenshot()")
+
+        image = np.ctypeslib.as_array(pixels_pointer.contents).reshape((height, width, 4))
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+        cv2.flip(image, 0, dst=image)
+        return image
+
+    def screenshot(self, timeout=0.5):
         """
         Returns:
-            np.ndarray: Image array in RGBA color space
-                Note that image is upside down
+            np.ndarray: Image array in RGB color space, already flipped upright
         """
+        self._swap_stuck_capture_state_if_needed()
+
         if self.connect_id == 0:
             self.connect()
 
         if self.height == 0:
             self.get_resolution()
 
-        width_ptr = ctypes.pointer(ctypes.c_int(self.width))
-        height_ptr = ctypes.pointer(ctypes.c_int(self.height))
-        length = self.width * self.height * 4
-        pixels_pointer = ctypes.pointer((ctypes.c_ubyte * length)())
+        with self._screenshot_state_lock:
+            future = self._pending_screenshot
+            if future is None:
+                future = self._get_screenshot_executor().submit(self._capture_display)
+                self._pending_screenshot = future
+                self._screenshot_pending_since = time.monotonic()
 
-        ret = self.ev_run_sync(
-            self.lib.nemu_capture_display,
-            self.connect_id,
-            self.display_id,
-            length,
-            width_ptr,
-            height_ptr,
-            pixels_pointer,
-            timeout=timeout,
-        )
-        if ret > 0:
-            raise NemuIpcError("nemu_capture_display failed during screenshot()")
-
-        # image = np.ctypeslib.as_array(pixels_pointer, shape=(self.height, self.width, 4))
-        image = np.ctypeslib.as_array(pixels_pointer.contents).reshape((self.height, self.width, 4))
-        image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
-        cv2.flip(image, 0, dst=image)
-        return image
+        timeout = max(0.0, float(timeout))
+        try:
+            image = future.result(timeout=timeout)
+        except FutureTimeoutError as exc:
+            # 不取消：运行中的 ctypes 调用无法安全终止。下一轮继续等待并复用其有效结果。
+            raise TimeoutError(f"MuMu截图超过 {timeout:.2f}s，等待同一个 IPC 调用完成") from exc
+        except Exception:
+            with self._screenshot_state_lock:
+                if self._pending_screenshot is future:
+                    self._pending_screenshot = None
+            raise
+        else:
+            with self._screenshot_state_lock:
+                if self._pending_screenshot is future:
+                    self._pending_screenshot = None
+            return image
 
     def down(self, x, y):
         """
@@ -1057,9 +1207,78 @@ class MumuControl(AbstractInput):
                 self.down(*point)
                 time.sleep(0.020)
 
-            # Keep the release stationary long enough to stop list momentum, but
-            # well below mouse_drag's old 500 ms hold that could reorder a team.
             time.sleep(0.200)
+        finally:
+            self.up()
+
+    def mouse_swipe_for_team_scroll(
+        self, x, y, duration=0.3, dx=0, dy=0, move_back=True
+    ) -> None:
+        """Scroll the team list without triggering team reordering or momentum."""
+        distance = (dx**2 + dy**2) ** 0.5
+        if distance == 0:
+            return
+
+        escape_distance = (
+            MUMU_TEAM_SCROLL_ESCAPE_DISTANCE_AT_1080P * cfg.set_win_size / 1080
+        )
+        unit_x = dx / distance
+        unit_y = dy / distance
+        # Upward page swipes must begin inside the visible team rows. Downward
+        # reset swipes shift their touch point instead, keeping the endpoint
+        # inside the client while preserving the same post-escape distance.
+        shift_start = dy > 0
+        touch_x = x - unit_x * escape_distance if shift_start else x
+        touch_y = y - unit_y * escape_distance if shift_start else y
+        plan = build_scroll_swipe_plan(
+            touch_x,
+            touch_y,
+            dx + unit_x * escape_distance,
+            dy + unit_y * escape_distance,
+            duration,
+            escape_distance=escape_distance,
+            escape_duration=0,
+        )
+        start = plan[0][0]
+        self.down(*start)
+        try:
+            if len(plan) > 1:
+                escape, escape_duration = plan[1]
+                time.sleep(escape_duration)
+                self.down(*escape)
+                # Give the game one render frame to recognize this as a scroll
+                # before measuring the remaining, row-accurate part of the drag.
+                time.sleep(MUMU_TEAM_SCROLL_ESCAPE_HOLD_DURATION)
+
+                end, remaining_duration = plan[-1]
+                if end != escape:
+                    move_x = end[0] - escape[0]
+                    move_y = end[1] - escape[1]
+                    point_spacing = 8 * cfg.set_win_size / 1080
+                    segment_count = max(
+                        int((move_x**2 + move_y**2) ** 0.5 / point_spacing),
+                        1,
+                    )
+                    segment_duration = remaining_duration / segment_count
+                    for step in range(1, segment_count + 1):
+                        time.sleep(segment_duration)
+                        ratio = step / segment_count
+                        self.down(
+                            escape[0] + move_x * ratio,
+                            escape[1] + move_y * ratio,
+                        )
+
+            if len(plan) > 1:
+                end = plan[-1][0]
+                settle_steps = round(
+                    MUMU_TEAM_SCROLL_SETTLE_DURATION
+                    / MUMU_TEAM_SCROLL_SETTLE_STEP_DURATION
+                )
+                # Refresh the stationary contact while holding it. MuMu's
+                # velocity tracker then sees an explicit zero-speed tail.
+                for _ in range(settle_steps):
+                    time.sleep(MUMU_TEAM_SCROLL_SETTLE_STEP_DURATION)
+                    self.down(*end)
         finally:
             self.up()
 

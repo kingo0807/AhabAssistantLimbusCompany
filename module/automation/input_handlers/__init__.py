@@ -89,6 +89,12 @@ class AbstractInput:
             f"输入适配器 {self.__class__.__name__} 未实现 mouse_swipe_for_scroll"
         )
 
+    def mouse_swipe_for_team_scroll(
+        self, x, y, duration=0.3, dx=0, dy=0, move_back=True
+    ) -> None:
+        """滚动编队列表；适配器可覆盖以规避队伍拖拽判定。"""
+        self.mouse_swipe_for_scroll(x, y, duration, dx, dy, move_back)
+
     def mouse_drag_down(self, x, y, reverse=1, move_back=True) -> None:
         """鼠标从指定位置向下拖动
 

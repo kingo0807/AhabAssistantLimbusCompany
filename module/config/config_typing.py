@@ -87,6 +87,9 @@ class TeamSetting(BaseModel):
     re_formation_each_floor: bool = False
     """每个楼层重新编队"""
 
+    normal_to_hard_floor: int = 0
+    """进入困难模式的楼层"""
+
     use_starlight: bool = False
     """开局星光换钱"""
 
@@ -101,6 +104,9 @@ class TeamSetting(BaseModel):
 
     defense_for_solo: bool = False
     """小指良单通杀家人"""
+
+    defense_for_solo_turns: int = 5
+    """小指良连续全员防御回合数"""
 
     fixed_team_use: bool = False
     """固定队伍用途"""
@@ -197,7 +203,6 @@ class TeamSetting(BaseModel):
 
     mirror_normal_count: int = 0
     """普通镜牢次数"""
-
 
 class ConfigModel(BaseModel):
     """配置模型"""
@@ -347,13 +352,19 @@ class ConfigModel(BaseModel):
     """是否使用模拟器"""
 
     simulator_type: int
-    """0:mumu, 10:其他"""
+    """0:mumu, 1:BlueStacks 5, 10:其他"""
+
+    simulator_host: str
+    """BlueStacks 或其他模拟器的 ADB 主机名或 IP 地址"""
 
     simulator_port: int
-    """端口"""
+    """BlueStacks 或其他模拟器的 ADB 端口"""
 
     mumu_instance_number: int
     """mumu模拟器的实例编号"""
+
+    bluestacks_instance_name: str
+    """BlueStacks 5 的内部实例名；留空时按端口或唯一实例自动选择"""
 
     start_emulator_timeout: int
     """启动模拟器超时时间"""
