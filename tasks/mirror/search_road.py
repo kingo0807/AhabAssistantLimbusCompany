@@ -1,4 +1,3 @@
-import heapq
 import time
 from enum import Enum
 from functools import lru_cache
@@ -12,6 +11,7 @@ from module.config import cfg
 from module.logger import log
 from module.my_error.my_error import InputAttributeError
 from tasks.base.retry import retry
+from tasks.mirror.route_planning import find_best_route, find_furthest_class_targets
 
 # 道路网格参数基于 2560×1440 游戏截图标定。
 ROAD_COLUMN_GAP = 520
@@ -782,127 +782,20 @@ class RouteGraph:
         return None, None, None
 
     def find_min_weight_route(self) -> tuple[float, list[Node]]:
-        """
-        使用Dijkstra算法计算从入口到出口的最小权重路径
-        返回：(最小总权重, 路径节点列表)
-        """
-        # 确定起点节点（column1 的初始公交位置）
-        start_node = self.columns["column1"][self.bus_row]
+        """选择总权重最低，并在同权重时战斗更少、更轻的确定性路线。"""
 
-        # 只把最靠后的 Boss 列作为终点，避免模型把中间节点误识别成 Boss 时提前截断路线。
-        end_nodes = []
-        for column in reversed(tuple(self.columns.values())):
-            end_nodes = [node for node in column.values() if node.node_class == "boss_battle"]
-            if end_nodes:
-                break
+        start_node = self.columns["column1"][self.bus_row]
+        layers = [tuple(column.values()) for column in self.columns.values()]
+        end_nodes = find_furthest_class_targets(layers, "boss_battle")
 
         if not end_nodes:
-            # 确定目标列：至多三列，取当前最大列（不超过 3）
-            current_max_column = self.column_count
-            target_column_number = min(current_max_column, 3)
+            target_column_number = min(self.column_count, 3)
             target_column = f"column{target_column_number}"
-
-            # 检查目标列是否存在
             if target_column not in self.columns:
-                return float("inf"), []  # 目标列不存在，无法到达
+                return float("inf"), []
+            end_nodes = list(self.columns[target_column].values())
 
-            # 收集目标列的所有节点
-            target_nodes = list(self.columns[target_column].values())
-            if not target_nodes:
-                return float("inf"), []  # 目标列无节点，无法到达
-
-            # 初始化距离字典，所有节点初始距离为无穷大，起点距离为自身权重
-            distances = {
-                node: float("inf")
-                for column in self.columns.values()
-                for pos_node in column.values()
-                for node in [pos_node]
-            }
-            distances[start_node] = start_node.weight
-
-            # 优先队列：(当前总权重, 节点唯一标识（避免比较Node）, 当前节点, 路径列表)
-            heap = []
-            heapq.heappush(heap, (start_node.weight, id(start_node), start_node, [start_node]))
-
-            # 记录已处理的节点
-            processed = set()
-
-            min_total = float("inf")
-            min_path = []
-
-            while heap:
-                current_total, _, current_node, current_path = heapq.heappop(heap)
-
-                if current_node in processed:
-                    continue
-                processed.add(current_node)
-
-                # 检查是否是目标节点（目标列的节点）
-                if current_node in target_nodes:
-                    # 更新最小路径
-                    if current_total < min_total:
-                        min_total = current_total
-                        min_path = current_path.copy()
-
-                # 遍历所有邻接节点
-                for next_node in current_node.next_nodes:
-                    if next_node in processed:
-                        continue  # 已处理过，跳过
-
-                    new_total = current_total + next_node.weight
-                    new_path = current_path + [next_node]
-
-                    # 如果找到更短路径，更新距离并加入队列
-                    if new_total < distances[next_node]:
-                        distances[next_node] = new_total
-                        heapq.heappush(heap, (new_total, id(next_node), next_node, new_path))
-
-            # 返回找到的最小路径，若没有则返回无穷大和空列表
-            return (min_total, min_path) if min_total != float("inf") else (float("inf"), [])
-
-        # 初始化距离字典，所有节点初始距离为无穷大，起点距离为自身权重
-        distances = {
-            node: float("inf")
-            for column in self.columns.values()
-            for pos_node in column.values()
-            for node in [pos_node]
-        }
-        distances[start_node] = start_node.weight
-
-        # 优先队列：(当前总权重, 节点唯一标识（避免比较Node）, 当前节点, 路径列表)
-        heap = []
-        heapq.heappush(heap, (start_node.weight, id(start_node), start_node, [start_node]))
-
-        # 记录已处理的节点（优化：当节点第一次弹出时，已找到最短路径）
-        processed = set()
-
-        while heap:
-            current_total, _, current_node, current_path = heapq.heappop(heap)  # 忽略辅助标识
-
-            if current_node in processed:
-                continue
-            processed.add(current_node)
-
-            # 到达终点，返回结果
-            if current_node in end_nodes:
-                return current_total, current_path
-
-            # 遍历所有邻接节点
-            for next_node in current_node.next_nodes:
-                if next_node in processed:
-                    continue  # 已处理过，跳过
-
-                new_total = current_total + next_node.weight
-                new_path = current_path + [next_node]
-
-                # 如果找到更短路径，更新并加入队列
-                if new_total < distances[next_node]:
-                    distances[next_node] = new_total
-                    # 添加辅助标识（id(next_node)）确保堆能正确排序
-                    heapq.heappush(heap, (new_total, id(next_node), next_node, new_path))
-
-        # 无可达路径
-        return float("inf"), []
+        return find_best_route(start_node, end_nodes)
 
     def get_path_directions(self, path: list[Node]) -> tuple[list[str], list[str]]:
         """

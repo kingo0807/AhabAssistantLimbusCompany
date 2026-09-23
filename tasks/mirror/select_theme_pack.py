@@ -6,6 +6,7 @@ from module.config import cfg, theme_list
 from module.decorator.decorator import begin_and_finish_time_log
 from module.logger import log
 from tasks.base.back_init_menu import back_init_menu
+from tasks.mirror.theme_pack_profile import get_theme_pack_target_floor, select_theme_pack_index
 from utils.image_utils import ImageUtils
 from utils.path_manager import path_manager
 
@@ -65,6 +66,11 @@ def select_theme_pack(hard_switch=False, floor=None, team_num=None, use_custom_t
     loop_count = 30
     auto.model = "clam"
     scale = cfg.set_win_size / 1080
+    # 此处 floor 表示刚打完/当前所在楼层；主题包决定的是下一层。
+    # 旧逻辑直接用 floor 查历史表，导致所有学习结果整体错后一层。
+    profile_floor = get_theme_pack_target_floor(floor)
+    if profile_floor is not None:
+        log.debug(f"卡包历史耗时目标楼层: 当前{floor}层 -> 第{profile_floor}层")
     if path_manager.current_language == "zh_cn":
         theme_pack_list_zh = theme_list.get_effective_theme_pack_list(
             hard_switch, "zh_cn", team_num, use_custom_theme_pack_weight
@@ -201,12 +207,18 @@ def select_theme_pack(hard_switch=False, floor=None, team_num=None, use_custom_t
                 log.debug(f"当前主题包权重列表：{list(zip(pack_name, weight_list))}")
                 # 如果存在权重最大值大于等于优选阈值的主题包，则选择该主题包
                 if max_weight >= int(theme_list.preferred_thresholds):
-                    max_index = weight_list.index(max_weight)
+                    max_index, selection_reason = select_theme_pack_index(
+                        pack_name,
+                        weight_list,
+                        profile_floor,
+                        int(theme_list.preferred_thresholds),
+                    )
                     pack = all_theme_pack[max_index]
                     auto.mouse_drag_down(pack[0], pack[1])
                     log.debug(f"选择卡包: {pack}")
                     _wait_for_theme_pack_transition()
-                    msg = f"此次选择卡包关键词：{pack_name[max_index]}"
+                    reason = f"（{selection_reason}）" if selection_reason else ""
+                    msg = f"此次选择卡包关键词：{pack_name[max_index]}{reason}"
                     log.info(msg)
                     return
 
@@ -226,13 +238,19 @@ def select_theme_pack(hard_switch=False, floor=None, team_num=None, use_custom_t
         if refresh_times <= 0:
             try:
                 max_weight = max(weight_list)
-                max_index = weight_list.index(max_weight)
+                max_index, selection_reason = select_theme_pack_index(
+                    pack_name,
+                    weight_list,
+                    profile_floor,
+                    int(theme_list.preferred_thresholds),
+                )
                 pack = all_theme_pack[max_index]
                 auto.mouse_drag_down(pack[0], pack[1])
                 log.debug(f"选择卡包: {pack}")
                 _wait_for_theme_pack_transition()
                 log.debug("无匹配最低阈值的主题包，选择最高权重主题包")
-                msg = f"无匹配最低阈值的主题包，选择最高权重主题包\n此次选择卡包关键词：{pack_name[max_index]}"
+                reason = f"（{selection_reason}）" if selection_reason else ""
+                msg = f"无匹配最低阈值的主题包，选择最高权重主题包\n此次选择卡包关键词：{pack_name[max_index]}{reason}"
                 log.info(msg)
                 return
             except Exception as e:

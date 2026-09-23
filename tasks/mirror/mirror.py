@@ -136,6 +136,27 @@ class Mirror:
 
         self.bequest_from_the_previous_game = False
         self.resumed_run = False
+        self._turn_keyword_bbox = None
+        self._turn_keyword_bbox_loaded = False
+        self._last_turn_ocr_at = float("-inf")
+
+    def _is_turn_visible_by_ocr(self, min_interval: float = 0.75) -> bool:
+        """限频识别战斗回合文字，并复用模板区域，避免道中循环反复读图。"""
+
+        now = time.monotonic()
+        if now - self._last_turn_ocr_at < min_interval:
+            return False
+        self._last_turn_ocr_at = now
+        if not self._turn_keyword_bbox_loaded:
+            self._turn_keyword_bbox_loaded = True
+            try:
+                image = ImageUtils.load_image("battle/turn_assets.png")
+                self._turn_keyword_bbox = ImageUtils.get_bbox(image)
+            except Exception:
+                self._turn_keyword_bbox = None
+        if self._turn_keyword_bbox is None:
+            return False
+        return auto.find_text_element("turn", self._turn_keyword_bbox) is not False
 
     def _record_floor_pack(self, floor_num: int, now: float | None = None) -> None:
         """记录新楼层起点；断点续跑时只报告缺失，不构造虚假的超长耗时。"""
@@ -509,9 +530,7 @@ class Mirror:
                     self._fight()
                     continue
             else:
-                turn_bbox = ImageUtils.get_bbox(ImageUtils.load_image("battle/turn_assets.png"))
-                turn_ocr_result = auto.find_text_element("turn", turn_bbox)
-                if turn_ocr_result is not False:
+                if self._is_turn_visible_by_ocr():
                     self._fight()
                     continue
             if auto.find_element("battle/win_rate_card.png") and auto.find_element("battle/gear_right.png"):

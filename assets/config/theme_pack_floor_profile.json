@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-24",
+  "source": "12局完整镜牢、60条有效楼层样本",
+  "minimum_samples": 3,
+  "minimum_improvement_seconds": 15,
+  "floors": {
+    "2": {
+      "当斩": {"samples": 6, "average_seconds": 227},
+      "cleaved": {"samples": 6, "average_seconds": 227},
+      "地狱鸡": {"samples": 5, "average_seconds": 285},
+      "chick": {"samples": 5, "average_seconds": 285}
+    },
+    "3": {
+      "情感屈从": {"samples": 4, "average_seconds": 302},
+      "subserv": {"samples": 4, "average_seconds": 302},
+      "情感饥渴": {"samples": 3, "average_seconds": 316},
+      "cravi": {"samples": 3, "average_seconds": 316}
+    },
+    "4": {
+      "落的忧": {"samples": 5, "average_seconds": 370},
+      "degraded": {"samples": 5, "average_seconds": 370},
+      "骨断": {"samples": 4, "average_seconds": 391},
+      "bones": {"samples": 4, "average_seconds": 391}
+    },
+    "5": {
+      "吞噬的": {"samples": 3, "average_seconds": 400},
+      "devoured": {"samples": 3, "average_seconds": 400},
+      "沉迷的": {"samples": 5, "average_seconds": 451},
+      "addict": {"samples": 5, "average_seconds": 451},
+      "骨断": {"samples": 3, "average_seconds": 457},
+      "bones": {"samples": 3, "average_seconds": 457}
+    }
+  }
+}

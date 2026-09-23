@@ -1,4 +1,4 @@
-from tasks.mirror.search_road import Row, RouteGraph, all_node_weight
+from tasks.mirror.search_road import Node, RouteGraph, Row, all_node_weight
 
 
 def test_route_weights_are_time_oriented_and_preserve_battle_severity() -> None:
@@ -58,3 +58,34 @@ def test_internal_boss_misclassification_is_not_used_as_terminal() -> None:
     _, path = graph.find_min_weight_route()
 
     assert [node.node_class for node in path] == ["bus", "boss_battle", "battle", "boss_battle"]
+
+
+def test_runtime_route_graph_prefers_fewer_battles_when_weight_is_equal() -> None:
+    graph = object.__new__(RouteGraph)
+    graph.bus_row = Row.MID
+    graph.column_count = 4
+
+    start = Node("bus", 1)
+    battle = Node("battle", 3)
+    safe_event = Node("event", 2)
+    event_after_battle = Node("event", 3)
+    safe_shop = Node("shop", 4)
+    boss = Node("boss_battle", 1)
+    start.add_next_node(battle)
+    start.add_next_node(safe_event)
+    battle.add_next_node(event_after_battle)
+    safe_event.add_next_node(safe_shop)
+    event_after_battle.add_next_node(boss)
+    safe_shop.add_next_node(boss)
+
+    graph.columns = {
+        "column1": {Row.MID: start},
+        "column2": {Row.TOP: battle, Row.BOTTOM: safe_event},
+        "column3": {Row.TOP: event_after_battle, Row.BOTTOM: safe_shop},
+        "column4": {Row.MID: boss},
+    }
+
+    weight, path = graph.find_min_weight_route()
+
+    assert weight == 8
+    assert path == [start, safe_event, safe_shop, boss]
