@@ -14,6 +14,7 @@ from module.logger import log
 from module.ocr import ocr
 from tasks import sins
 from tasks.base.retry import retry
+from tasks.battle.recognition_state import BattleRecognitionState
 from tasks.event import event_handling
 from utils.image_utils import ImageUtils
 from utils.utils import find_skill3
@@ -106,6 +107,19 @@ class Battle:
 
         return new_time
 
+    @staticmethod
+    def _wait_for_battle_animation_start(timeout: float) -> bool:
+        """等待交战标志出现，快机器立即返回，超时仍由原有重试兜底。"""
+
+        return bool(
+            auto.wait_for_element(
+                "battle/pause_assets.png",
+                timeout=timeout,
+                poll_interval=0.15,
+                threshold=0.75,
+            )
+        )
+
     def _battle_operation(
         self,
         first_turn: bool,
@@ -146,8 +160,7 @@ class Battle:
                 log.info(f"小指良单通连续防御已执行，剩余 {defense_for_solo_state.remaining_turns} 回合")
                 if defense_for_solo_state.remaining_turns == 0:
                     log.info("本次镜牢的连续防御已完成，后续回合恢复普通战斗操作")
-            sleep(2)
-            if not auto.find_element("battle/pause_assets.png", take_screenshot=True):
+            if not self._wait_for_battle_animation_start(timeout=2.0):
                 auto.key_press("p")
                 sleep(0.5)
                 auto.key_press("enter")
@@ -166,8 +179,7 @@ class Battle:
                 auto.key_press("p")
                 sleep(0.5)
                 auto.key_press("enter")
-            sleep(2)
-            if not auto.find_element("battle/pause_assets.png", take_screenshot=True):
+            if not self._wait_for_battle_animation_start(timeout=2.0):
                 auto.key_press("p")
                 sleep(0.5)
                 auto.key_press("enter")
@@ -183,8 +195,7 @@ class Battle:
                     auto.mouse_click(pos[0], pos[1])
                     auto.click_element("battle/gear_right.png")
             else:
-                sleep(1)
-                if not auto.find_element("battle/pause_assets.png", threshold=0.75):
+                if not self._wait_for_battle_animation_start(timeout=1.0):
                     self.mouse_click_rate = True
                 else:
                     self.mouse_click_rate = False
@@ -207,7 +218,7 @@ class Battle:
         chance = self.INIT_CHANCE
         waiting = self._update_wait_time()
         total_count = 0
-        fail_count = 0
+        recognition_state = BattleRecognitionState()
         in_mirror = False
         first_battle_reward = None
         event_chance = 15
@@ -217,12 +228,16 @@ class Battle:
             defense_first_round = True
             turn_ocr_bbox = ImageUtils.get_bbox(ImageUtils.load_image("battle/turn_ocr_assets.png"))
 
+        turn_keyword_bbox = None
+        turn_keyword_bbox_loaded = False
+
         first_turn = True
         defense_for_solo_used_this_turn = False
         start_time = time.time()
 
         def perform_battle_operation() -> None:
             nonlocal defense_for_solo_used_this_turn
+            recognition_state.record_operation()
             limited_defense_succeeded = self._battle_operation(
                 first_turn=first_turn,
                 defense_first_round=defense_first_round,
@@ -234,6 +249,34 @@ class Battle:
             defense_for_solo_used_this_turn = (
                 defense_for_solo_used_this_turn or limited_defense_succeeded
             )
+
+        def recognize_turn_by_ocr(*, force: bool = False) -> bool:
+            nonlocal turn_keyword_bbox, turn_keyword_bbox_loaded
+            if turn_keyword_bbox_loaded and turn_keyword_bbox is None:
+                return False
+            if not recognition_state.should_try_turn_ocr(
+                time.monotonic(),
+                prefer_ocr=self.identify_keyword_turn is False,
+                force=force,
+            ):
+                return False
+            if not turn_keyword_bbox_loaded:
+                # 模板只在第一次真正需要 OCR 时读取，正常战斗不承担磁盘读取开销。
+                turn_keyword_bbox_loaded = True
+                try:
+                    turn_keyword_bbox = ImageUtils.get_bbox(ImageUtils.load_image("battle/turn_assets.png"))
+                except Exception:
+                    turn_keyword_bbox = None
+            if turn_keyword_bbox is None:
+                return False
+            try:
+                sc = ImageUtils.crop(auto.get_screenshot_array(), turn_keyword_bbox)
+                sc = cv2.inRange(sc, 50, 255)
+                result = ocr.run(sc)
+                ocr_result = "".join(result.txts).lower()
+            except Exception:
+                return False
+            return "turn" in ocr_result
 
         self.fail_times = 0
         while self.running:
@@ -294,7 +337,7 @@ class Battle:
                             confirm_button[0] + 200 * my_scale,
                             confirm_button[1] - 350 * my_scale,
                         )
-                    except:
+                    except Exception:
                         continue
 
                 auto.click_element("battle/dead_all_confirm_assets.png")
@@ -345,27 +388,11 @@ class Battle:
                         self.cur_turn = -1
                     if self.cur_turn == 1:
                         first_turn = True
-                except:
+                except Exception:
                     self.cur_turn = -1  # 表示识别失败
 
-            if fail_count >= 10 or self.identify_keyword_turn is False:
-                # 如果多次识别不到战斗界面
-                try:
-                    turn_bbox = ImageUtils.get_bbox(ImageUtils.load_image("battle/turn_assets.png"))
-                    sc = ImageUtils.crop(auto.get_screenshot_array(), turn_bbox)
-                    sc = cv2.inRange(sc, 50, 255)
-                    result = ocr.run(sc)
-                    ocr_result = [result.txts[i] for i in range(len(result.txts))]
-                    ocr_result = "".join(ocr_result).lower()
-                except:
-                    ocr_result = ""
-                if "turn" in ocr_result:
-                    perform_battle_operation()
-                    chance = self.INIT_CHANCE
-                    waiting = self._update_wait_time(waiting, False, total_count)
-                    self.identify_keyword_turn = False
-                    continue
-            elif fail_count >= 5:
+            # 快速模板始终先行；连续失败后逐步扩大识别范围，OCR 保留为限频兜底。
+            if recognition_state.consecutive_failures >= 5:
                 if auto.click_element("battle/turn_assets.png") or auto.find_element("battle/win_rate_assets.png"):
                     perform_battle_operation()
                     chance = self.INIT_CHANCE
@@ -379,20 +406,17 @@ class Battle:
                     chance = self.INIT_CHANCE
                     waiting = self._update_wait_time(waiting, False, total_count)
                     continue
+            if recognize_turn_by_ocr():
+                perform_battle_operation()
+                chance = self.INIT_CHANCE
+                waiting = self._update_wait_time(waiting, False, total_count)
+                self.identify_keyword_turn = False
+                continue
             if chance < 5:
                 if not infinite_battle:
                     auto.mouse_to_blank()
-                try:
-                    turn_bbox = ImageUtils.get_bbox(ImageUtils.load_image("battle/turn_assets.png"))
-                    sc = ImageUtils.crop(auto.get_screenshot_array(), turn_bbox)
-                    sc = cv2.inRange(sc, 50, 255)
-                    result = ocr.run(sc)
-                    ocr_result = [result.txts[i] for i in range(len(result.txts))]
-                    ocr_result = "".join(ocr_result).lower()
-                except:
-                    ocr_result = ""
                 if (
-                    "turn" in ocr_result
+                    recognize_turn_by_ocr(force=True)
                     or auto.click_element("battle/turn_assets.png")
                     or auto.find_element("battle/win_rate_assets.png")
                     or auto.find_element("battle/win_rate_card.png", threshold=0.75)
@@ -535,7 +559,7 @@ class Battle:
             # 更新等待时间
             waiting = self._update_wait_time(waiting, True, total_count)
             # 统计失败次数
-            fail_count += 1
+            recognition_state.record_failure()
             if chance < 0:
                 if infinite_battle:
                     continue
@@ -547,8 +571,11 @@ class Battle:
             match_success_rate = 100
         else:
             # 保留最多三位小数
-            match_success_rate = (1 - fail_count / total_count) * 100
-        msg = f"此次战斗匹配失败次数{fail_count} 匹配总次数{total_count} 匹配成功率{match_success_rate}%"
+            match_success_rate = (1 - recognition_state.total_failures / total_count) * 100
+        msg = (
+            f"此次战斗匹配失败次数{recognition_state.total_failures} "
+            f"匹配总次数{total_count} 匹配成功率{match_success_rate}%"
+        )
         log.debug(msg)
         if self.first_battle:
             return first_battle_reward
