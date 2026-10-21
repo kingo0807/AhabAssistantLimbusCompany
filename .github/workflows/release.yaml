@@ -15,6 +15,10 @@ jobs:
   release:
     runs-on: windows-latest
     needs: build
+    # fork 的默认 workflow 权限是 read，不显式声明会无法创建 release / 触发下游
+    permissions:
+      contents: write
+      actions: write
     steps:
       - name: Download Artifact
         uses: actions/download-artifact@main
