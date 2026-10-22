@@ -26,8 +26,9 @@ Limbus Company 是 Unity 游戏，指针位置来自 `GetCursorPos()`，而不�
 * 只覆盖函数头 5 个字节，不解析指令；被覆盖的字节在挂钩期间永远不会被执行
   （跳转先发生），卸载时按原样写回，所以即使切断了一条指令也是安全的。
 * 挂/脱钩期间短暂挂起目标进程的其他线程，避免有线程正好停在被打补丁的字节上。
-* 目标函数头已经是 `E9`（被别的工具挂过）时拒绝注入，避免把别人的跳转当成
-  原始字节保存下来。
+* 目标函数头不做"是否已被挂钩"的预判：`user32!GetCursorPos` 在很多 Windows
+  版本上本身就是一条 `E9` 跳板（跳到 win32u），首字节 E9 是正常实现。即使真的
+  被第三方工具挂过，我们也只是临时覆盖前 5 字节，卸载时按原样写回。
 * 任何一步失败都只记录日志并返回 False，调用方退回 `SetCursorPos`，行为与
   原来的后台模式一致。
 
@@ -432,12 +433,16 @@ class _HookSession:
             raise OSError(f"目标进程里找不到 {module_name}")
         self.target = remote_base + (local_addr - local_base)
 
-        # 读函数头：如果已经是 E9，说明被别的工具挂过，此时保存的"原始字节"
-        # 其实是别人的跳转，卸载时会把游戏指针带进已释放的内存，直接放弃。
-        head = self._read(self.target, 8)
-        if head[0:1] == b"\xE9":
-            raise OSError("GetCursorPos 已被其他工具挂钩，放弃注入")
+        # 读函数头。注意：user32 里的 GetCursorPos 在很多 Windows 版本上
+        # 本身就是一条 5 字节的 `E9` 跳板（跳到 win32u），首字节 E9 属于
+        # 正常实现，不能据此判断"被别的工具挂过"。真被第三方 hook 时，我们
+        # 也只是临时覆盖前 5 字节，卸载时按原样写回，同样安全。
+        head = self._read(self.target, 16)
         self.original = head[:5]
+        log.debug(
+            f"GetCursorPos 入口字节: {head[:8].hex(' ')}"
+            + ("（jmp 跳板）" if head[0:1] == b"\xE9" else "")
+        )
 
         self.block = _alloc_near(self.handle, self.target, BLOCK_SIZE)
         if not self.block:
