@@ -7,6 +7,7 @@
   Body: 原始 zip 字节
 """
 
+import base64
 import io
 import os
 import zipfile
@@ -38,7 +39,7 @@ def read_token() -> str:
         return ""
 
 
-def collect_logs(max_bytes: int = MAX_BYTES) -> bytes:
+def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
     """把 logs 目录里的日志打成 zip；新文件优先，总大小超限就跳过大的。"""
     buf = io.BytesIO()
     entries = []
@@ -60,17 +61,19 @@ def collect_logs(max_bytes: int = MAX_BYTES) -> bytes:
         if os.path.exists("./assets/config/version.txt"):
             with open("./assets/config/version.txt", "r", encoding="utf-8") as f:
                 zf.writestr("version.txt", f.read())
+        if note.strip():
+            zf.writestr("note.txt", note)
     return buf.getvalue()
 
 
-def upload_logs(timeout: int = 30) -> tuple[bool, str]:
+def upload_logs(note: str = "", timeout: int = 30) -> tuple[bool, str]:
     """打包并上传日志，返回 (是否成功, 提示文本)。调用方应放在后台线程里跑。"""
     token = read_token()
     if not token:
         return False, "未配置上传口令：请在程序目录放一个 upload.txt"
 
     try:
-        payload = collect_logs()
+        payload = collect_logs(note=note)
     except Exception as e:
         log.error(f"打包日志失败:{e}")
         return False, f"打包日志失败:{e}"
@@ -89,6 +92,7 @@ def upload_logs(timeout: int = 30) -> tuple[bool, str]:
             headers={
                 "X-AALC-Token": token,
                 "X-AALC-Name": name,
+                "X-AALC-Note": base64.b64encode(note.encode("utf-8")).decode("ascii"),
                 "Content-Type": "application/octet-stream",
             },
         )

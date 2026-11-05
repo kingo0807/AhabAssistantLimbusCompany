@@ -6,6 +6,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QSizePolicy,
     QWidget,
 )
@@ -678,13 +679,22 @@ class SettingInterface(QWidget):
         os.startfile(os.path.abspath("./logs"))
 
     def __onUploadLogsCardClicked(self):
-        """在后台线程打包上传日志，期间禁用按钮避免重复点击。"""
+        """先让用户写一句需求，再在后台打包上传，期间禁用按钮避免重复点击。"""
         from module.update.upload_log import upload_logs
+
+        note, accepted = QInputDialog.getMultiLineText(
+            self,
+            QT_TRANSLATE_NOOP("SettingInterface", "上传日志"),
+            QT_TRANSLATE_NOOP("SettingInterface", "描述一下问题或需求（可留空）："),
+            "",
+        )
+        if not accepted:
+            return
 
         self.upload_logs_card.button.setEnabled(False)
 
         def work():
-            ok, msg = upload_logs()
+            ok, msg = upload_logs(note=note)
             self.uploadLogsFinished.emit(ok, msg)
 
         threading.Thread(target=work, daemon=True).start()
