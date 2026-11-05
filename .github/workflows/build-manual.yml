@@ -1,7 +1,7 @@
 name: Build (manual)
 
 # 只构建、只上传产物，不创建 Release。用于先测后发的流程：
-# 手动触发 → 产物在 Actions 里下载 → 测过之后再决定要不要正式发版。
+# 推到 dev 分支或手动触发 → 产物在 Actions 里下载 → 测过之后再决定要不要正式发版。
 on:
   workflow_dispatch:
     inputs:
@@ -9,9 +9,12 @@ on:
         description: "版本号（写进 assets/config/version.txt）"
         required: true
         default: "V1.6.1-dev"
+  push:
+    branches:
+      - dev-custom-update
 
 jobs:
   build:
     uses: ./.github/workflows/reusable-build.yml
     with:
-      version: ${{ inputs.version }}
+      version: ${{ inputs.version || 'V1.6.1-dev' }}
