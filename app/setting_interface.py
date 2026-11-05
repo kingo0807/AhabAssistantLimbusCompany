@@ -1,4 +1,5 @@
 import datetime
+import threading
 
 from PySide6.QtCore import QT_TRANSLATE_NOOP, QPoint, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
@@ -47,6 +48,9 @@ from utils.schedule_helper import ScheduleHelper
 class SettingInterface(QWidget):
     # 手动检查图片资源更新请求，由主窗口统一接管后续流程。
     manualResourceSyncRequested = Signal()
+
+    # 日志上传完成信号：后台线程打包上传，回到主线程再更新界面。
+    uploadLogsFinished = Signal(bool, str)
 
     def __init__(self, parent=None):
         """初始化设置页及其资源同步入口。
@@ -431,6 +435,16 @@ class SettingInterface(QWidget):
             QT_TRANSLATE_NOOP("BasePrimaryPushSettingCard", "打开日志文件夹"),
             parent=self.logs_group,
         )
+        self.upload_logs_card = BasePrimaryPushSettingCard(
+            QT_TRANSLATE_NOOP("BasePrimaryPushSettingCard", "上传"),
+            FIF.SHARE,
+            QT_TRANSLATE_NOOP("BasePrimaryPushSettingCard", "上传日志"),
+            QT_TRANSLATE_NOOP(
+                "BasePrimaryPushSettingCard",
+                "把 logs 目录打包上传到自建服务器，便于远程排查",
+            ),
+            parent=self.logs_group,
+        )
 
         self.about_group = BaseSettingCardGroup(QT_TRANSLATE_NOOP("BaseSettingCardGroup", "关于"), self.scroll_widget)
         self.github_card = BasePrimaryPushSettingCard(
@@ -549,6 +563,7 @@ class SettingInterface(QWidget):
         self.update_group.addSettingCard(self.check_image_resource_update_card)
 
         self.logs_group.addSettingCard(self.open_logs_card)
+        self.logs_group.addSettingCard(self.upload_logs_card)
 
         self.about_group.addSettingCard(self.github_card)
         self.about_group.addSettingCard(self.discord_group_card)
@@ -624,6 +639,8 @@ class SettingInterface(QWidget):
         # 先连接按钮点击类交互，包括图片资源手动检查入口。
         self.game_path_card.clicked.connect(self.__onGamePathCardClicked)
         self.open_logs_card.clicked.connect(self.__onOpenLogsCardClicked)
+        self.upload_logs_card.clicked.connect(self.__onUploadLogsCardClicked)
+        self.uploadLogsFinished.connect(self.__onUploadLogsFinished)
         self.screenshot_benchmark_card.clicked.connect(self.__onScreenshotBenchmarkCardClicked)
         self.theme_pack_card.clicked.connect(self.__onThemePackCardClicked)
         self.check_image_resource_update_card.clicked.connect(self.__onCheckImageResourceUpdateClicked)
@@ -659,6 +676,42 @@ class SettingInterface(QWidget):
         import os
 
         os.startfile(os.path.abspath("./logs"))
+
+    def __onUploadLogsCardClicked(self):
+        """在后台线程打包上传日志，期间禁用按钮避免重复点击。"""
+        from module.update.upload_log import upload_logs
+
+        self.upload_logs_card.button.setEnabled(False)
+
+        def work():
+            ok, msg = upload_logs()
+            self.uploadLogsFinished.emit(ok, msg)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def __onUploadLogsFinished(self, ok: bool, msg: str):
+        """回到主线程恢复按钮并提示结果。"""
+        self.upload_logs_card.button.setEnabled(True)
+        if ok:
+            BaseInfoBar.success(
+                title=QT_TRANSLATE_NOOP("BaseInfoBar", "日志已上传"),
+                content=msg,
+                orient=Qt.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.BOTTOM_RIGHT,
+                duration=5000,
+                parent=self,
+            )
+        else:
+            BaseInfoBar.warning(
+                title=QT_TRANSLATE_NOOP("BaseInfoBar", "上传失败"),
+                content=msg,
+                orient=Qt.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.BOTTOM_RIGHT,
+                duration=8000,
+                parent=self,
+            )
 
     def __onScreenshotBenchmarkCardClicked(self):
         from module.automation.screenshot import ScreenShot
@@ -792,6 +845,7 @@ class SettingInterface(QWidget):
         self.logs_group.retranslateUi()
         self.about_group.retranslateUi()
         self.open_logs_card.retranslateUi()
+        self.upload_logs_card.retranslateUi()
         self.github_card.retranslateUi()
         self.discord_group_card.retranslateUi()
         self.feedback_card.retranslateUi()
