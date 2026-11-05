@@ -21,6 +21,23 @@ from utils.utils import decrypt_string
 
 md_renderer = MarkdownIt("gfm-like", {"html": True})
 
+# 自建更新源。程序启动时会把工作目录切到程序所在目录，因此这里读的是安装根目录下的
+# update_url.txt；换服务器只要改这个文件，不用重新打包。
+DEFAULT_UPDATE_MANIFEST = "https://dl.wangyuyue.xyz/aalc/latest.json"
+
+
+def update_manifest_url() -> str:
+    """返回自建更新源的清单地址，优先使用安装目录下 update_url.txt 的覆盖值。"""
+    path = os.path.join(os.getcwd(), "update_url.txt")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            url = f.read().strip()
+        if url:
+            return url
+    except OSError:
+        pass
+    return DEFAULT_UPDATE_MANIFEST
+
 
 class UpdateStatus(Enum):
     """
@@ -59,8 +76,6 @@ class UpdateThread(QThread):
         self.flag = flag  # 标志位，用于控制是否执行检查更新
         self.error_msg = ""  # 错误信息
 
-        self.user = "KIYI671"
-        self.repo = "AhabAssistantLimbusCompany"
         self.new_version = ""
         # 记录本次检查后“当前版本是否已追平最新版本”，供资源同步门禁读取。
         self.is_current_version_latest = False
@@ -100,8 +115,6 @@ class UpdateThread(QThread):
             content,
             flags=re.IGNORECASE,
         )
-        if cfg.update_source == "GitHub":
-            content = content + "\n\n若下载速度较慢，可尝试使用 Mirror酱（设置 → 关于 → 更新源） 高速下载"
         return content
 
     def _emit_version_check_result(self, version: str, current_version, latest_version, content: str) -> None:
@@ -136,8 +149,8 @@ class UpdateThread(QThread):
             if self.flag and not cfg.get_value("check_update"):
                 return
 
-            # 第一步：优先从 Mirror酱 获取最新版本信息，并同步记录版本门禁需要的数据。
-            data = self.check_update_info_mirrorchyan()
+            # 第一步：从自建更新源读取最新版本信息，并同步记录版本门禁需要的数据。
+            data = self.check_update_info_custom()
             version = data["version_name"]
             # 同步记录本次检查得到的最新版本号与比较结果，供资源同步门禁直接复用。
             current_version, latest_version = self._set_version_gate_state(version)
@@ -147,8 +160,8 @@ class UpdateThread(QThread):
             # 第三步：比较当前版本与最新版本，并统一发出检查结果信号。
             self._emit_version_check_result(version, current_version, latest_version, content)
         except Exception as e:
-            # Mirror酱 失败后自动回退到 GitHub，保持原有软件更新逻辑不变。
-            log.error(f"从Mirror酱源检查更新失败:{e},尝试使用GitHub源检查更新")
+            # 自建源失败后仍按原有回退流程再试一次，避免偶发网络抖动直接报失败。
+            log.error(f"从自建更新源检查更新失败:{e},尝试回退")
             try:
                 data = self.check_update_info_github()
                 version = data["tag_name"]
@@ -167,31 +180,36 @@ class UpdateThread(QThread):
                 self._emit_version_check_result(version, current_version, latest_version, content)
             except Exception as e:
                 # 异常处理，发送失败信号
-                log.error(f"Mirror酱源与GitHub源均检查更新失败:{e}")
+                log.error(f"自建更新源检查失败:{e}")
                 self.updateSignal.emit(UpdateStatus.FAILURE)
+
+    def check_update_info_custom(self):
+        """
+        从自建更新源读取版本信息。
+
+        返回:
+        含 version_name 与 release_note 的字典，沿用原来更新源的数据结构。
+        """
+        response = requests.get(update_manifest_url(), timeout=10, headers=cfg.useragent)
+        response.raise_for_status()
+        data = response.json()
+        return {"version_name": data["version"], "release_note": data.get("notes", "")}
 
     def check_update_info_github(self):
         """
-        从 GitHub 获取最新发布版本的信息。
+        把自建更新源的结果包装成 GitHub release 的形状，让下载与版本比较逻辑原样复用。
 
         返回:
-        最新发布版本的信息（JSON 格式）
+        {"tag_name": ..., "body": ..., "assets": [...]}
         """
-        if not cfg.update_prerelease_enable:
-            response = requests.get(
-                f"https://api.github.com/repos/{self.user}/{self.repo}/releases/latest",
-                timeout=10,
-                headers=cfg.useragent,
-            )
-        else:
-            response = requests.get(
-                f"https://api.github.com/repos/{self.user}/{self.repo}/releases",
-                timeout=10,
-                headers=cfg.useragent,
-            )
+        response = requests.get(update_manifest_url(), timeout=10, headers=cfg.useragent)
         response.raise_for_status()
-        # 根据配置决定是否包含预发布版本
-        return response.json()[0] if cfg.update_prerelease_enable else response.json()
+        data = response.json()
+        return {
+            "tag_name": data["version"],
+            "body": data.get("notes", ""),
+            "assets": [{"name": "AALC.7z", "browser_download_url": data["url"]}],
+        }
 
     def check_update_info_mirrorchyan(self, cdk=""):
         """
@@ -250,49 +268,16 @@ class UpdateThread(QThread):
         return None
 
     def get_assets_url(self):
+        """返回自建更新源里 .7z 的下载地址。"""
         try:
-            if cfg.update_source == "MirrorChyan":
-                if cfg.mirrorchyan_cdk == "":
-                    self.error_msg = "未设置 Mirror酱 CDK"
-                    self.updateSignal.emit(UpdateStatus.FAILURE)
-                    return None
-                # 符合Mirror酱条件
-                cdk = decrypt_string(cfg.mirrorchyan_cdk)
-                response = self.check_update_info_mirrorchyan(cdk)
-                if response.status_code == 200:
-                    mirrorchyan_data = response.json()
-                    if mirrorchyan_data["code"] == 0 and mirrorchyan_data["msg"] == "success":
-                        url = mirrorchyan_data["data"]["url"]
-                        return url
-                else:
-                    try:
-                        mirrorchyan_data = response.json()
-                        self.code = mirrorchyan_data["code"]
-                        self.error_msg = mirrorchyan_data["msg"]
+            data = self.check_update_info_github()
+            assets_url = self.get_download_url_from_assets(data["assets"])
 
-                        cdk_error_messages = {
-                            7001: "Mirror酱 CDK 已过期",
-                            7002: "Mirror酱 CDK 错误",
-                            7003: "Mirror酱 CDK 今日下载次数已达上限",
-                            7004: "Mirror酱 CDK 类型和待下载的资源不匹配",
-                            7005: "Mirror酱 CDK 已被封禁",
-                        }
-                        if self.code in cdk_error_messages:
-                            self.error_msg = cdk_error_messages[self.code]
-                    except:
-                        self.error_msg = "Mirror酱API请求失败"
-                    self.updateSignal.emit(UpdateStatus.FAILURE)
-                    return None
-            else:
-                # 复用统一的 GitHub release 查询逻辑，避免重复维护接口路径与预发布分支判断。
-                data = self.check_update_info_github()
-                assets_url = self.get_download_url_from_assets(data["assets"])
-
-                # 如果没有可用的下载 URL，则发送成功信号并返回
-                if assets_url is None:
-                    self.updateSignal.emit(UpdateStatus.SUCCESS)
-                    return
-                return assets_url
+            # 如果没有可用的下载 URL，则发送成功信号并返回
+            if assets_url is None:
+                self.updateSignal.emit(UpdateStatus.SUCCESS)
+                return
+            return assets_url
         except Exception as e:
             # 异常处理，发送失败信号
             log.error(f"更新失败:{e}")
