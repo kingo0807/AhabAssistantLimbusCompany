@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 import requests
@@ -112,14 +113,25 @@ def download(url: str, dest: Path) -> None:
     log(f"下载上一版包 {url} -> {written / 1048576:.1f} MB，{time.time() - started:.1f}s（声明 {total} 字节）")
 
 
+def run_seven_zip(args: list[str], cwd: Path | None = None) -> None:
+    """调用 7z；失败时把 stderr 带出来，别让它静默变成一句 FileNotFoundError。"""
+    result = subprocess.run(
+        [SEVEN_ZIP, *args],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"7z {args[0]} 失败（exit {result.returncode}）："
+            f"{(result.stderr or result.stdout or '').strip()[:400]}"
+        )
+
+
 def extract(package: Path, dest: Path) -> Path:
     """解压 7z 到 dest，返回归档根目录（单顶层目录时就是那个目录）。"""
     dest.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [SEVEN_ZIP, "x", "-y", f"-o{dest}", str(package)],
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
+    run_seven_zip(["x", "-y", f"-o{dest}", str(package.resolve())])
     entries = list(dest.iterdir())
     dirs = [p for p in entries if p.is_dir()]
     files = [p for p in entries if p.is_file()]
@@ -207,11 +219,10 @@ def build_patch(
 
     if out_package.exists():
         out_package.unlink()
-    subprocess.run(
-        [SEVEN_ZIP, "a", "-t7z", "-mx=7", str(out_package), "*"],
+    # 7z 的 cwd 是 staging，输出路径必须绝对，否则会落到 staging\dist\ 下
+    run_seven_zip(
+        ["a", "-t7z", "-mx=7", str(out_package.resolve()), "*"],
         cwd=staging,
-        check=True,
-        stdout=subprocess.DEVNULL,
     )
 
 
@@ -251,11 +262,7 @@ def verify_patch(
     if unpacked.exists():
         shutil.rmtree(unpacked)
     unpacked.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [SEVEN_ZIP, "x", "-y", f"-o{unpacked}", str(patch_package)],
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
+    run_seven_zip(["x", "-y", f"-o{unpacked}", str(patch_package.resolve())])
 
     if not (unpacked / "changes.json").is_file():
         return False, "补丁包里没有根目录级的 changes.json"
@@ -293,7 +300,7 @@ def main() -> int:
         print(f"找不到新包：{new_package}", file=sys.stderr)
         return 1
 
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     # 文件名形如 AALC_V1.6.5-dev.7z，去掉 .7z 后缀就是补丁包的前缀
     stem = new_package.stem
@@ -389,6 +396,7 @@ def main() -> int:
         return 0
     except Exception as exc:  # 构建不能因为增量包而失败，但要在界面上看得见
         announce_error(f"增量包生成失败，已跳过：{exc!r}")
+        print(traceback.format_exc(), flush=True)
         return 0
     finally:
         if args.keep_work:
