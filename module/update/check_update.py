@@ -75,6 +75,8 @@ class UpdateThread(QThread):
         self.timeout = timeout  # 超时时间
         self.flag = flag  # 标志位，用于控制是否执行检查更新
         self.error_msg = ""  # 错误信息
+        # 命中增量包时记下全量包地址，下载失败可以回退到它。
+        self.fallback_download_url = None
 
         self.new_version = ""
         # 记录本次检查后“当前版本是否已追平最新版本”，供资源同步门禁读取。
@@ -195,6 +197,42 @@ class UpdateThread(QThread):
         data = response.json()
         return {"version_name": data["version"], "release_note": data.get("notes", "")}
 
+    @staticmethod
+    def _pick_download_url(data):
+        """
+        从清单里选出这次要下载的包地址。
+
+        规则：清单若带 incremental 块，且 base_version 与当前版本完全相等，
+        才用增量包；否则一律回落到全量包 url。基线不匹配时套用增量包会把
+        安装目录改坏，所以这里必须严格相等，不能“小于等于”或“更高版本”。
+
+        参数:
+        data -- latest.json 解析出来的字典
+
+        返回:
+        (本次下载地址, 全量包地址)；没有命中增量时两者相同
+        """
+        full_url = str(data.get("url") or "")
+        incremental = data.get("incremental")
+        if not isinstance(incremental, dict):
+            return full_url, full_url
+
+        base_version = str(incremental.get("base_version") or "").strip()
+        patch_url = str(incremental.get("url") or "").strip()
+        if not base_version or not patch_url or not is_valid_url(patch_url):
+            return full_url, full_url
+
+        try:
+            if parse(cfg.version.lstrip("Vv")) != parse(base_version.lstrip("Vv")):
+                log.info(f"增量包基线为 {base_version}，当前版本 {cfg.version}，改用全量包")
+                return full_url, full_url
+        except Exception:
+            log.info("增量包基线与当前版本无法比较，改用全量包")
+            return full_url, full_url
+
+        log.info(f"命中增量更新：{base_version} -> {data.get('version')}")
+        return patch_url, full_url
+
     def check_update_info_github(self):
         """
         把自建更新源的结果包装成 GitHub release 的形状，让下载与版本比较逻辑原样复用。
@@ -205,10 +243,13 @@ class UpdateThread(QThread):
         response = requests.get(update_manifest_url(), timeout=10, headers=cfg.useragent)
         response.raise_for_status()
         data = response.json()
+        # 优先增量包，基线不匹配时自动回落到全量包。
+        download_url, full_url = self._pick_download_url(data)
+        self.fallback_download_url = full_url if download_url != full_url else None
         return {
             "tag_name": data["version"],
             "body": data.get("notes", ""),
-            "assets": [{"name": "AALC.7z", "browser_download_url": data["url"]}],
+            "assets": [{"name": "AALC.7z", "browser_download_url": download_url}],
         }
 
     def check_update_info_mirrorchyan(self, cdk=""):
@@ -313,7 +354,7 @@ def handle_update_status(
             # 如果用户确认更新，则从指定的URL下载更新资源
             assets_url = update_thread.get_assets_url()
             if assets_url:
-                start_update_thread(assets_url)
+                start_update_thread(assets_url, getattr(update_thread, "fallback_download_url", None))
     elif status == UpdateStatus.SUCCESS:
         # 第二类：已经是最新版本时，按策略显示成功提示。
         if not show_success:
@@ -418,10 +459,11 @@ def is_valid_url(url):
         return False
 
 
-def update(assets_url):
+def update(assets_url, fallback_url=None):
     """
     从给定的URL下载更新文件到本地。
     :param assets_url : 更新文件的URL。
+    :param fallback_url : 增量包下载失败时改用的全量包URL，可为空。
     """
     # 检查URL是否有效
     if not is_valid_url(assets_url):
@@ -480,17 +522,22 @@ def update(assets_url):
             mediator.download_complete.emit(file_name)
 
     except requests.exceptions.RequestException as e:
+        # 增量包可能已被清理或发布不完整，回退到全量包再试一次。
+        if fallback_url:
+            log.warning(f"增量包下载失败，改用全量包重试: {e}")
+            return update(fallback_url, None)
         log.error(f"下载失败，请检查网络: {e}")
     except OSError as e:
         log.error(f"文件操作失败: {e}")
 
 
-def start_update_thread(assets_url):
+def start_update_thread(assets_url, fallback_url=None):
     """
     在单独的线程中启动更新功能。
     :param assets_url: 更新文件的URL。
+    :param fallback_url: 增量包下载失败时改用的全量包URL，可为空。
     """
-    thread = Thread(target=update, args=(assets_url,))
+    thread = Thread(target=update, args=(assets_url, fallback_url))
     thread.start()
     return thread
 
