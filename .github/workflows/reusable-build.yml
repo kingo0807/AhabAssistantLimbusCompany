@@ -43,13 +43,21 @@ jobs:
         run: |
           uv run python ./scripts/build_incremental.py --new "dist/AALC_${{ inputs.version }}.7z" --out-dir dist --verify
 
-      # 上传打包结果
+      # 上传打包结果（archive:false 只允许单文件，所以补丁单独一个产物）
       - name: Upload build artifacts
         uses: actions/upload-artifact@main
         with:
           name: AALC_${{ inputs.version }}
           path: |
             dist/AALC_${{ inputs.version }}.7z
+          archive: false
+
+      # 补丁包 + 元数据。archive 保持默认（打包成 zip），多文件才能一起传。
+      - name: Upload incremental patch
+        uses: actions/upload-artifact@main
+        with:
+          name: AALC_${{ inputs.version }}.patch
+          path: |
             dist/AALC_${{ inputs.version }}.patch.7z
             dist/AALC_${{ inputs.version }}.patch.json
-          archive: false
+          if-no-files-found: warn
