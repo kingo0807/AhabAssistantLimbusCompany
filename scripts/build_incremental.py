@@ -44,6 +44,11 @@ import requests
 DEFAULT_MANIFEST = "https://dl.wangyuyue.xyz/aalc/latest.json"
 USER_AGENT = {"User-Agent": "AALC-build-incremental/1.0"}
 
+# Windows runner 上 stdout 默认是 cp1252，中文日志会直接 UnicodeEncodeError 把脚本打死。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 def _find_seven_zip() -> str:
     """优先用环境变量，其次 PATH，最后 Windows 默认安装位置。"""
@@ -75,6 +80,14 @@ def warn(message: str) -> None:
         print(f"::warning::{message}", flush=True)
     else:
         print(f"WARNING: {message}", flush=True)
+
+
+def announce_error(message: str) -> None:
+    """真正的异常用 ::error:: 报出来，避免 continue-on-error 把它藏成绿色。"""
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::error::{message}", flush=True)
+    else:
+        print(f"ERROR: {message}", flush=True)
 
 
 def sha256_file(path: Path) -> str:
@@ -288,9 +301,9 @@ def main() -> int:
     meta_path = out_dir / f"{stem}.patch.json"
 
     work = Path(tempfile.mkdtemp(prefix="aalc-patch-"))
-    log(f"临时目录：{work}")
 
     try:
+        log(f"临时目录：{work}")
         # 第一步：拿到上一版包
         base_version = ""
         base_url = ""
@@ -374,8 +387,8 @@ def main() -> int:
         if verify_ok is False:
             return 1
         return 0
-    except Exception as exc:  # 构建不能因为增量包而失败
-        warn(f"增量包生成失败，已跳过：{exc!r}")
+    except Exception as exc:  # 构建不能因为增量包而失败，但要在界面上看得见
+        announce_error(f"增量包生成失败，已跳过：{exc!r}")
         return 0
     finally:
         if args.keep_work:
