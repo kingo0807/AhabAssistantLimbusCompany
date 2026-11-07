@@ -17,4 +17,4 @@ jobs:
   build:
     uses: ./.github/workflows/reusable-build.yml
     with:
-      version: ${{ inputs.version || 'V1.6.5-dev' }}
+      version: ${{ inputs.version || 'V1.6.6-dev' }}

@@ -3,9 +3,68 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 import psutil
+
+
+class _Tee:
+    """把 stdout/stderr 同时写进文件，并给每行加时间戳。
+
+    更新器是独立进程，以前所有输出只到控制台，窗口一关就什么都不剩，
+    出问题（比如下载慢、解压失败）事后完全无从查证。
+    """
+
+    def __init__(self, stream, path):
+        self._stream = stream
+        self._pending = ""
+        try:
+            self._file = open(path, "a", encoding="utf-8", buffering=1)
+        except OSError:
+            self._file = None
+
+    def write(self, data):
+        try:
+            self._stream.write(data)
+        except Exception:
+            pass
+        if self._file is None:
+            return len(data)
+        self._pending += data
+        while "\n" in self._pending:
+            line, self._pending = self._pending.split("\n", 1)
+            try:
+                self._file.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {line}\n")
+            except Exception:
+                break
+        return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._file is not None:
+            try:
+                self._file.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+
+def install_stdout_tee(log_path):
+    """把后续输出同时落盘到 log_path；超过 2 MB 先清掉，避免无限增长。"""
+    try:
+        if os.path.exists(log_path) and os.path.getsize(log_path) > 2 * 1024 * 1024:
+            os.remove(log_path)
+        sys.stdout = _Tee(sys.stdout, log_path)
+        sys.stderr = _Tee(sys.stderr, log_path)
+        print(f"更新器日志: {log_path}")
+    except Exception as exc:
+        print(f"启用更新器日志失败: {exc}")
 
 
 class UpdateManifestError(ValueError):
@@ -337,6 +396,9 @@ def check_temp_dir_and_run():
         sys.exit(1)
 
     temp_path = os.path.abspath("./update_temp")
+    # 先落一份日志，再开始干活：后面无论解压失败还是覆盖卡住都留得下证据
+    os.makedirs(temp_path, exist_ok=True)
+    install_stdout_tee(os.path.join(temp_path, "updater.log"))
     file_path = sys.argv[0]
     destination_path = os.path.join(temp_path, os.path.basename(file_path))
 

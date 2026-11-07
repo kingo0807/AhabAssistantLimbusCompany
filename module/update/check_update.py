@@ -2,6 +2,7 @@ import os  # 导入os模块以便操作文件路径
 import re
 import shutil
 import subprocess
+import time
 from enum import Enum
 from threading import Thread
 from typing import Callable
@@ -488,18 +489,34 @@ def update(assets_url, fallback_url=None):
             downloaded = 0
             os.makedirs("update_temp", exist_ok=True)
             file_path = os.path.join("update_temp", file_name)
+            started = time.time()
+            log.info(f"开始下载 {file_name}（{total_size / 1048576:.1f} MB）来自 {assets_url}")
 
-            # 第三步：边下载边写入本地文件，并在可计算百分比时同步上报下载进度。
+            # 第三步：边下载边写入本地文件。
+            # 256 KB 一块且只在百分比变化时发信号：之前是 1 KB 一块、每块都发一次
+            # Qt 进度信号，一个 153 MB 的包要发 15 万次，明显拖慢下载。
+            last_percent = -1
             with open(file_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024):
+                for chunk in response.iter_content(chunk_size=262144):
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
                         if total_size > 0:
                             progress = int(downloaded / total_size * 100)
-                            mediator.update_progress.emit(progress)
+                            if progress != last_percent:
+                                last_percent = progress
+                                mediator.update_progress.emit(progress)
+                                if progress and progress % 10 == 0:
+                                    elapsed = max(time.time() - started, 0.001)
+                                    log.info(
+                                        f"下载进度 {progress}%（{downloaded / 1048576:.1f}/"
+                                        f"{total_size / 1048576:.1f} MB，{downloaded / elapsed / 1048576:.2f} MB/s）"
+                                    )
 
+        elapsed = max(time.time() - started, 0.001)
         log.info("下载进度100%")
+        if downloaded:
+            log.info(f"下载完成：{downloaded / 1048576:.1f} MB，用时 {elapsed:.1f}s，平均 {downloaded / elapsed / 1048576:.2f} MB/s")
 
         if "OCR" in file_name:
             exe_path = os.path.abspath("./assets/binary/7za.exe")
@@ -526,7 +543,8 @@ def update(assets_url, fallback_url=None):
         if fallback_url:
             log.warning(f"增量包下载失败，改用全量包重试: {e}")
             return update(fallback_url, None)
-        log.error(f"下载失败，请检查网络: {e}")
+        received = locals().get("downloaded", 0)
+        log.error(f"下载失败，请检查网络: {e}（已接收 {received / 1048576:.1f} MB）")
     except OSError as e:
         log.error(f"文件操作失败: {e}")
 
