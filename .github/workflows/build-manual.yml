@@ -8,7 +8,7 @@ on:
       version:
         description: "版本号（写进 assets/config/version.txt）"
         required: true
-        default: "V1.6.1-dev"
+        default: "V1.6.7-dev"
   push:
     branches:
       - dev-custom-update
@@ -17,4 +17,4 @@ jobs:
   build:
     uses: ./.github/workflows/reusable-build.yml
     with:
-      version: ${{ inputs.version || 'V1.6.6-dev' }}
+      version: ${{ inputs.version || 'V1.6.7-dev' }}
