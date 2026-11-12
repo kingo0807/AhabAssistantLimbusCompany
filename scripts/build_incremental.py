@@ -32,6 +32,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -111,6 +112,56 @@ def download(url: str, dest: Path) -> None:
                     f.write(chunk)
                     written += len(chunk)
     log(f"下载上一版包 {url} -> {written / 1048576:.1f} MB，{time.time() - started:.1f}s（声明 {total} 字节）")
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    """把 V1.6.7-dev 之类解析成 (1, 6, 7)，用于比较 dist release 的先后。"""
+    match = re.search(r"(\d+(?:\.\d+)*)", version)
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def find_dist_release_base(repo: str, token: str, new_version: str):
+    """在 GitHub 的 dist-* release 里找比 new_version 小的最新一版。
+
+    返回 (版本号, 全量包下载地址)；没有可用基线时返回 None。
+    这里只认 dist-* 前缀，避免把仓库里其它 v1.0.9.x 预发布当基线。
+    """
+    headers = dict(USER_AGENT)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    response = requests.get(
+        f"https://api.github.com/repos/{repo}/releases?per_page=100",
+        headers=headers,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    new_key = version_key(new_version)
+    best = None
+    for release in response.json():
+        tag = str(release.get("tag_name") or "")
+        if not tag.startswith("dist-") or release.get("draft"):
+            continue
+        version = tag[len("dist-"):]
+        key = version_key(version)
+        if not key or key >= new_key:
+            continue
+        full_asset = next(
+            (
+                asset
+                for asset in release.get("assets", [])
+                if asset.get("name", "").endswith(".7z") and ".patch." not in asset["name"]
+            ),
+            None,
+        )
+        if not full_asset:
+            continue
+        if best is None or key > best[0]:
+            best = (key, version, full_asset["browser_download_url"])
+
+    return None if best is None else (best[1], best[2])
 
 
 def run_seven_zip(args: list[str], cwd: Path | None = None) -> None:
@@ -291,6 +342,16 @@ def main() -> int:
     parser.add_argument("--out-dir", default="dist", help="补丁产物输出目录")
     parser.add_argument("--manifest", default=DEFAULT_MANIFEST, help="自建更新清单地址")
     parser.add_argument("--base-package", default=None, help="本地已有的上一版包（跳过下载，调试用）")
+    parser.add_argument(
+        "--base-repo",
+        default=os.environ.get("GITHUB_REPOSITORY", ""),
+        help="从这个仓库的 dist-* release 取基线（优先于清单下载）",
+    )
+    parser.add_argument(
+        "--base-token",
+        default=os.environ.get("GITHUB_TOKEN", ""),
+        help="访问 GitHub API 的 token（CI 里由 GITHUB_TOKEN 提供）",
+    )
     parser.add_argument("--verify", action="store_true", help="应用补丁并与新版本逐字节比对")
     parser.add_argument("--keep-work", action="store_true", help="保留临时目录（调试用）")
     args = parser.parse_args()
@@ -314,10 +375,25 @@ def main() -> int:
         # 第一步：拿到上一版包
         base_version = ""
         base_url = ""
+        base_package = None
+        # 优先从 GitHub 的 dist release 取基线：CI runner 访问 GitHub 比走自建隧道快一个数量级。
         if args.base_package:
             base_package = Path(args.base_package).resolve()
             log(f"使用本地基线包：{base_package}")
-        else:
+        elif args.base_repo:
+            try:
+                found = find_dist_release_base(args.base_repo, args.base_token, stem[len("AALC_"):])
+                if found:
+                    base_version, base_url = found
+                    base_package = work / "base.7z"
+                    log(f"使用 GitHub dist release 基线：{base_version}")
+                    download(base_url, base_package)
+                else:
+                    warn("dist release 里没有更早的版本，回退到清单下载基线")
+            except Exception as exc:
+                warn(f"从 GitHub dist release 取基线失败，回退到清单：{exc!r}")
+
+        if base_package is None:
             response = requests.get(args.manifest, timeout=20, headers=USER_AGENT)
             response.raise_for_status()
             published = response.json()
