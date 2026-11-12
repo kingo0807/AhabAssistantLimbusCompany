@@ -34,12 +34,14 @@ jobs:
           uv run python ./scripts/build.py --version ${{ inputs.version }}
 
       # 生成增量更新补丁：对照线上当前发布版本算差异。
+      # 优先从 dist-* release 取基线（GitHub API 需要 token，否则共享 runner IP 会 403）。
       # 拿不到上一版、或新旧无差异时脚本自己跳过并返回 0，绝不让全量构建失败。
       - name: build incremental patch
         continue-on-error: true
         env:
           # Windows runner 默认 cp1252，中文日志会让脚本直接崩
           PYTHONUTF8: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           uv run python ./scripts/build_incremental.py --new "dist/AALC_${{ inputs.version }}.7z" --out-dir dist --verify
 
