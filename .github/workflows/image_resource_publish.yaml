@@ -18,6 +18,8 @@ env:
 
 jobs:
   build-and-sync:
+    # dist-* 是自建分发用的构建产物 release，不参与上游图片资源发布。
+    if: github.event_name != 'release' || !startsWith(github.event.release.tag_name, 'dist-')
     runs-on: windows-latest
     steps:
       # 检出当前主仓库代码。
