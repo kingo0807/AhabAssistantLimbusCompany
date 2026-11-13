@@ -9,7 +9,7 @@ on:
       version:
         description: "版本号（写进 assets/config/version.txt）"
         required: true
-        default: "V1.6.11-dev"
+        default: "V1.6.12-dev"
   push:
     branches:
       - dev-custom-update
@@ -22,7 +22,7 @@ jobs:
   build:
     uses: ./.github/workflows/reusable-build.yml
     with:
-      version: ${{ inputs.version || 'V1.6.11-dev' }}
+      version: ${{ inputs.version || 'V1.6.12-dev' }}
 
   publish-dist:
     needs: build
@@ -44,7 +44,7 @@ jobs:
       - name: Generate latest.json
         run: |
           python3 scripts/make_latest_json.py \
-            --version "${{ inputs.version || 'V1.6.11-dev' }}" \
+            --version "${{ inputs.version || 'V1.6.12-dev' }}" \
             --dir dist \
             --notes-file release_notes.txt
 
@@ -52,7 +52,7 @@ jobs:
       - name: Publish dist release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ inputs.version || 'V1.6.11-dev' }}
+          VERSION: ${{ inputs.version || 'V1.6.12-dev' }}
         run: |
           set -euo pipefail
           tag="dist-${VERSION}"

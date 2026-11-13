@@ -19,9 +19,10 @@ import requests
 from module.logger import log
 from module.update.check_update import update_manifest_url
 
-# 隧道上行实测只有 20~27 KB/s，整包上传会撞上 Cloudflare 的等待上限（524）。
-# 这里限制的是"原始未压缩字节"，压缩后通常只有 100 KB 左右，几秒就能传完。
-MAX_BYTES = 1024 * 1024
+# 2026-11-13 起日志上传直接落 NanoKVM Go 本地（局域网），不再走 Cloudflare 隧道，
+# 所以上限从 1MB 放宽到 8MB：截图改成原图 PNG 后单张就有 2~4MB。
+# 设备端 aalc-serve.py 的 MAX_BYTES 同为 8MB，两边要对齐。
+MAX_BYTES = 8 * 1024 * 1024
 
 
 def _safe_host_name(text: str, fallback: str = "pc") -> str:

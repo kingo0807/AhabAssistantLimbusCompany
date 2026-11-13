@@ -17,9 +17,8 @@ from module.logger import log
 
 CAPTURE_DIR = os.path.join("logs", "captures")
 KEEP = 3                # 本地最多留几张
-MAX_WIDTH = 1280        # 超过就等比缩小（标定用的是比例，不受影响）
-JPEG_QUALITY = 72       # 实测 1280 宽 q72 约 90~150 KB
-MAX_FILE_BYTES = 150 * 1024   # 单张上限，超了就降质量重存：隧道只有 10~27 KB/s，包越小越稳
+MAX_WIDTH = 0           # 0 = 保留原始分辨率（标定/OCR 都要原图）
+SAVE_FORMAT = "PNG"     # 无损保存，不做有损压缩
 SWITCH_FILE = "no_capture.txt"
 
 
@@ -50,22 +49,16 @@ def capture_shop(layer: int = 0) -> str | None:
 
 def _save(image, tag: str) -> str | None:
     try:
-        if image.width > MAX_WIDTH:
+        if MAX_WIDTH and image.width > MAX_WIDTH:
             ratio = MAX_WIDTH / float(image.width)
             new_size = (MAX_WIDTH, max(1, int(image.height * ratio)))
             image = image.resize(new_size)
         os.makedirs(CAPTURE_DIR, exist_ok=True)
-        name = f"{tag}_{time.strftime('%Y%m%d-%H%M%S')}.jpg"
+        name = f"{tag}_{time.strftime('%Y%m%d-%H%M%S')}.{SAVE_FORMAT.lower()}"
         path = os.path.join(CAPTURE_DIR, name)
-        rgb = image.convert("RGB")
-        quality = JPEG_QUALITY
-        while True:
-            rgb.save(path, "JPEG", quality=quality, optimize=True)
-            if os.path.getsize(path) <= MAX_FILE_BYTES or quality <= 55:
-                break
-            quality -= 8
+        image.convert("RGB").save(path, SAVE_FORMAT, optimize=True)
         _prune()
-        log.debug(f"已采集截图 {path} ({os.path.getsize(path)/1024:.0f}KB q{quality})")
+        log.debug(f"已采集截图 {path} ({os.path.getsize(path)/1024/1024:.1f}MB {image.width}x{image.height})")
         return path
     except Exception as e:
         log.debug(f"保存截图失败（已忽略）: {type(e).__name__}: {e}")
@@ -78,7 +71,7 @@ def _prune() -> None:
         files = [
             os.path.join(CAPTURE_DIR, n)
             for n in os.listdir(CAPTURE_DIR)
-            if n.lower().endswith(".jpg")
+            if n.lower().endswith((".png", ".jpg"))
         ]
         files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         for old in files[KEEP:]:
@@ -98,7 +91,7 @@ def latest_captures(limit: int = 1) -> list[tuple[str, str]]:
         files = [
             os.path.join(CAPTURE_DIR, n)
             for n in os.listdir(CAPTURE_DIR)
-            if n.lower().endswith(".jpg")
+            if n.lower().endswith((".png", ".jpg"))
         ]
         files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         return [(p, os.path.basename(p)) for p in files[:limit]]
