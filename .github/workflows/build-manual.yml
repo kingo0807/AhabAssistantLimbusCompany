@@ -1,4 +1,4 @@
-name: Build (manual)
+﻿name: Build (manual)
 
 # 推到 dev 分支或手动触发 → 构建 → 自动发布 dist-<版本> release。
 # 这个 release 是自建更新源的分发源：家里 KVM / 公网 VM 上的 aalc-sync 定时器
@@ -9,7 +9,7 @@ on:
       version:
         description: "版本号（写进 assets/config/version.txt）"
         required: true
-        default: "V1.6.8-dev"
+        default: "V1.6.9-dev"
   push:
     branches:
       - dev-custom-update
@@ -22,7 +22,7 @@ jobs:
   build:
     uses: ./.github/workflows/reusable-build.yml
     with:
-      version: ${{ inputs.version || 'V1.6.8-dev' }}
+      version: ${{ inputs.version || 'V1.6.9-dev' }}
 
   publish-dist:
     needs: build
@@ -44,7 +44,7 @@ jobs:
       - name: Generate latest.json
         run: |
           python3 scripts/make_latest_json.py \
-            --version "${{ inputs.version || 'V1.6.8-dev' }}" \
+            --version "${{ inputs.version || 'V1.6.9-dev' }}" \
             --dir dist \
             --notes-file release_notes.txt
 
@@ -52,7 +52,7 @@ jobs:
       - name: Publish dist release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ inputs.version || 'V1.6.8-dev' }}
+          VERSION: ${{ inputs.version || 'V1.6.9-dev' }}
         run: |
           set -euo pipefail
           tag="dist-${VERSION}"

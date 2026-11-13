@@ -49,11 +49,14 @@ def read_token() -> str:
 
 
 def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
-    """把**最新**那份日志的尾部打成 zip。
+    """把**最新**那份日志的尾部打成 zip，附带一张最新的商店截图。
 
     以前是把 logs 里所有文件都塞进去，结果一个大日志就有 4 MB，
     在这条隧道上必然 524。现在只取最近修改的那一个文件，并且只取尾部
     max_bytes 字节（debugLog.log 里最新的内容在末尾）。
+
+    截图（logs/captures/*.jpg）按剩余预算附带；JPEG 压缩率低，所以只带一张，
+    而且日志已经吃掉大半预算时直接不带，保证整包还在上限内。
     """
     buf = io.BytesIO()
     newest = None
@@ -66,19 +69,40 @@ def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
         if candidates:
             newest = max(candidates, key=lambda item: item[0])
 
+    log_blob = b""
+    log_name = ""
+    if newest is not None:
+        _, path, log_name = newest
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            log_blob = f.read()
+
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        if newest is not None:
-            _, path, name = newest
-            with open(path, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                size = f.tell()
-                f.seek(max(0, size - max_bytes))
-                zf.writestr("logs/" + name, f.read())
+        if log_name:
+            zf.writestr("logs/" + log_name, log_blob)
         if os.path.exists("./assets/config/version.txt"):
             with open("./assets/config/version.txt", "r", encoding="utf-8") as f:
                 zf.writestr("version.txt", f.read())
         if note.strip():
             zf.writestr("note.txt", note)
+
+        # 剩余预算给截图（日志是文本、压缩率高；截图基本按原大小占位，按未压缩算最保守）
+        try:
+            from module.update.shop_capture import latest_captures
+
+            remaining = max_bytes - len(log_blob) - 60 * 1024
+            for path, name in latest_captures(limit=1):
+                size = os.path.getsize(path)
+                if size > remaining:
+                    log.debug(f"截图 {name} 有 {size} 字节，超出上传预算，跳过")
+                    continue
+                with open(path, "rb") as f:
+                    zf.writestr("captures/" + name, f.read())
+                remaining -= size
+        except Exception as e:
+            log.debug(f"附带截图失败（已忽略）: {e}")
     return buf.getvalue()
 
 

@@ -6,6 +6,7 @@ from module.automation import auto
 from module.config import TeamSetting, cfg
 from module.logger import log
 from module.ocr import ocr
+from module.update.shop_capture import capture_shop
 from tasks import all_sinners_name, all_sinners_name_zh, all_systems, system_cn_zh
 from tasks.base.back_init_menu import back_init_menu
 from tasks.base.retry import retry
@@ -1328,6 +1329,8 @@ class Shop:
 
     # 在商店的处理
     def in_shop(self, layer):
+        # 采集一张真实商店截图，随「上传日志」一起发出；失败静默，不影响流程
+        capture_shop(layer)
         heal = False
         sell = False
         buy = False
