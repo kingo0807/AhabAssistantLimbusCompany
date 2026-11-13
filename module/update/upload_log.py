@@ -109,8 +109,12 @@ def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
     return buf.getvalue()
 
 
-def upload_logs(note: str = "", timeout: int = 30) -> tuple[bool, str]:
-    """打包并上传日志，返回 (是否成功, 提示文本)。调用方应放在后台线程里跑。"""
+def upload_logs(note: str = "", timeout: int = 0) -> tuple[bool, str]:
+    """打包并上传日志，返回 (是否成功, 提示文本)。调用方应放在后台线程里跑。
+
+    timeout=0 表示按包大小自动算：隧道上行实测 10~27 KB/s，晚高峰更低，
+    固定 30 秒对「日志 + 截图」这种包不够用（实测报 Read timed out）。
+    """
     token = read_token()
     if not token:
         return False, "未配置上传口令：请在程序目录放一个 upload.txt"
@@ -123,6 +127,11 @@ def upload_logs(note: str = "", timeout: int = 30) -> tuple[bool, str]:
 
     if not payload:
         return False, "没有可上传的日志"
+
+    if timeout <= 0:
+        # 按 6 KB/s 保守估，30 秒起步、最多 150 秒（Cloudflare 源站超时约 100 秒，留一点余量）
+        timeout = min(150, max(30, len(payload) // 6144 + 15))
+    log.info(f"上传 {len(payload)/1024:.0f} KB，超时按 {timeout} 秒")
 
     name = datetime.now().strftime("%Y%m%d-%H%M%S")
     name += "-" + _safe_host_name(os.environ.get("COMPUTERNAME", "pc")) + ".zip"

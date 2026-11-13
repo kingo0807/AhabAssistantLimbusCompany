@@ -17,9 +17,9 @@ from module.logger import log
 
 CAPTURE_DIR = os.path.join("logs", "captures")
 KEEP = 3                # 本地最多留几张
-MAX_WIDTH = 1440        # 超过就等比缩小（标定用的是比例，不受影响）
-JPEG_QUALITY = 78       # 实测 1440 宽 q78 约 150~250 KB
-MAX_FILE_BYTES = 300 * 1024   # 单张上限，超了就降质量重存，别把上传预算一个人吃掉
+MAX_WIDTH = 1280        # 超过就等比缩小（标定用的是比例，不受影响）
+JPEG_QUALITY = 72       # 实测 1280 宽 q72 约 90~150 KB
+MAX_FILE_BYTES = 150 * 1024   # 单张上限，超了就降质量重存：隧道只有 10~27 KB/s，包越小越稳
 SWITCH_FILE = "no_capture.txt"
 
 
