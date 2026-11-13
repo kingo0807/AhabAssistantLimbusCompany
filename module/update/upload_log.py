@@ -73,10 +73,13 @@ def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
     log_name = ""
     if newest is not None:
         _, path, log_name = newest
+        # 日志最多吃 55% 预算。以前这里直接用 max_bytes，日志一满就把截图额度吃成负数，
+        # 表现为「截图采集成功但永远传不上去」。
+        log_budget = max(64 * 1024, int(max_bytes * 0.55))
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            f.seek(max(0, size - max_bytes))
+            f.seek(max(0, size - log_budget))
             log_blob = f.read()
 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -92,7 +95,7 @@ def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
         try:
             from module.update.shop_capture import latest_captures
 
-            remaining = max_bytes - len(log_blob) - 60 * 1024
+            remaining = max_bytes - len(log_blob) - 12 * 1024
             for path, name in latest_captures(limit=1):
                 size = os.path.getsize(path)
                 if size > remaining:

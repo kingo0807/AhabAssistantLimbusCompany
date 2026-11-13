@@ -17,8 +17,9 @@ from module.logger import log
 
 CAPTURE_DIR = os.path.join("logs", "captures")
 KEEP = 3                # 本地最多留几张
-MAX_WIDTH = 1600        # 超过就等比缩小（标定用的是比例，不受影响）
-JPEG_QUALITY = 80       # 实测 1600 宽 q80 约 200~300 KB
+MAX_WIDTH = 1440        # 超过就等比缩小（标定用的是比例，不受影响）
+JPEG_QUALITY = 78       # 实测 1440 宽 q78 约 150~250 KB
+MAX_FILE_BYTES = 300 * 1024   # 单张上限，超了就降质量重存，别把上传预算一个人吃掉
 SWITCH_FILE = "no_capture.txt"
 
 
@@ -56,9 +57,15 @@ def _save(image, tag: str) -> str | None:
         os.makedirs(CAPTURE_DIR, exist_ok=True)
         name = f"{tag}_{time.strftime('%Y%m%d-%H%M%S')}.jpg"
         path = os.path.join(CAPTURE_DIR, name)
-        image.convert("RGB").save(path, "JPEG", quality=JPEG_QUALITY, optimize=True)
+        rgb = image.convert("RGB")
+        quality = JPEG_QUALITY
+        while True:
+            rgb.save(path, "JPEG", quality=quality, optimize=True)
+            if os.path.getsize(path) <= MAX_FILE_BYTES or quality <= 55:
+                break
+            quality -= 8
         _prune()
-        log.debug(f"已采集截图 {path}")
+        log.debug(f"已采集截图 {path} ({os.path.getsize(path)/1024:.0f}KB q{quality})")
         return path
     except Exception as e:
         log.debug(f"保存截图失败（已忽略）: {type(e).__name__}: {e}")
