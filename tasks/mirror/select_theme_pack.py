@@ -58,7 +58,7 @@ def select_theme_pack(hard_mode=False, floor=None, team_num=None, use_custom_the
     unknown_weight = int(theme_pack_list_zh.get("未知", theme_pack_list_en.get("unknown", -5)))
     refresh_times = 3
     if auto.find_element("mirror/road_in_mir/legend_assets.png", take_screenshot=True):
-        return
+        return None
     while True:
         # 自动截图
         if auto.take_screenshot() is None:
@@ -76,7 +76,7 @@ def select_theme_pack(hard_mode=False, floor=None, team_num=None, use_custom_the
                     sleep(3)
                     msg = "此次主题包选择了最左边的（活动）卡包"
                     log.info(msg)
-                    return
+                    return "（活动包）"
             weight_list = []
             pack_name = []
             if all_theme_pack := auto.find_element(
@@ -120,7 +120,7 @@ def select_theme_pack(hard_mode=False, floor=None, team_num=None, use_custom_the
                     sleep(3)
                     msg = f"此次选择卡包关键词：{pack_name[max_index]}"
                     log.info(msg)
-                    return
+                    return pack_name[max_index]
 
         except Exception as e:
             log.error(f"识别主题包出错:{e}")
@@ -146,7 +146,7 @@ def select_theme_pack(hard_mode=False, floor=None, team_num=None, use_custom_the
                 log.debug("无匹配最低阈值的主题包，选择最高权重主题包")
                 msg = f"无匹配最低阈值的主题包，选择最高权重主题包\n此次选择卡包关键词：{pack_name[max_index]}"
                 log.info(msg)
-                return
+                return pack_name[max_index]
             except Exception as e:
                 log.error(f"选择主题包出错:{e},尝试回到初始界面")
                 back_init_menu()

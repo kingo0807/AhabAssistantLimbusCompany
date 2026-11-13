@@ -8,6 +8,7 @@ from module.automation import auto
 from module.config import TeamSetting, cfg
 from module.decorator.decorator import begin_and_finish_time_log
 from module.logger import log
+from module.run_record import append_floor_records
 from module.my_error.my_error import (
     InputAttributeError,
     backMainWinError,
@@ -95,6 +96,8 @@ class Mirror:
         self.event_times = 0
 
         self.floor = 0
+        self.pack_by_floor = {}  # 层号 -> 该层选中的卡包关键词
+        self.floor_records = []  # [(层, 卡包, 秒, 计时完整)]，仅用于本局耗时记录
         self.theme_pack_timing_start_count = 0  # 从卡包页开始计时的次数，标识完整计时的楼层数
         self.current_floor_start_time = None  # 当前层开始计时的时刻
         self.current_floor_time_complete = False  # 从卡包页开始计时是完整的一层计时
@@ -120,7 +123,12 @@ class Mirror:
         msg = f"第{floor}层" if floor > 0 else "楼层未知"
         if not self.current_floor_time_complete:
             msg += "，计时不完整"
-        to_log_with_time(msg, end_time - self.current_floor_start_time)
+        elapsed = end_time - self.current_floor_start_time
+        to_log_with_time(msg, elapsed)
+        if floor > 0:
+            self.floor_records.append(
+                (floor, self.pack_by_floor.get(floor, ""), round(elapsed, 1), self.current_floor_time_complete)
+            )
 
     def _fight(self) -> None:
         _, elapsed = self._time_call(
@@ -293,7 +301,11 @@ class Mirror:
                     if self.floor > 0:
                         self._enter_hard_mode_if_needed()
                         switch_theme_pack_difficulty(self.hard_mode)
-                select_theme_pack(self.hard_mode, self.floor, self.team_order, self.use_custom_theme_pack_weight)
+                chosen_pack = select_theme_pack(
+                    self.hard_mode, self.floor, self.team_order, self.use_custom_theme_pack_weight
+                )
+                if chosen_pack:
+                    self.pack_by_floor[self.floor] = chosen_pack
                 if self.re_formation_each_floor:
                     self.first_battle = True
                 if new_floor:
@@ -757,6 +769,22 @@ class Mirror:
         if self.current_floor_start_time is None:
             self.current_floor_start_time = run_start_time
         self._log_floor_time(end_time, self.floor)
+
+        # 追加本局每层耗时到 records/mirror_runs.csv，失败只记日志不影响跑图
+        team_setting = cfg.config.teams.get(f"{self.team_order}")
+        append_floor_records(
+            ts=time.strftime("%Y-%m-%d %H:%M:%S"),
+            team_no=self.team_order,
+            team_remark=getattr(team_setting, "remark_name", "") or "",
+            system=self.system,
+            difficulty="困难" if self.hard_mode else "普通",
+            total_sec=elapsed_time,
+            combat_sec=self.battle_total_time,
+            event_sec=self.event_total_time,
+            shop_sec=self.shop_total_time,
+            road_sec=self.find_road_total_time,
+            floors=self.floor_records,
+        )
 
         # 输出战斗总时间
         msg = "此次镜牢在战斗"
@@ -1231,6 +1259,8 @@ class Mirror:
         self.first_battle = True
         self.start_time = time.time()
         self.floor = 0
+        self.pack_by_floor = {}
+        self.floor_records = []
         self.theme_pack_timing_start_count = 0
         self.current_floor_start_time = None
         self.current_floor_time_complete = False
