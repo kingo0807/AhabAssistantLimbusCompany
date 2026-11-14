@@ -23,13 +23,14 @@ from module.update.check_update import update_manifest_url
 # 仍然直连局域网 NanoKVM Go（不走 Cloudflare 隧道），上限放宽到 12MB。
 # 设备端 aalc-serve.py 的 MAX_BYTES 同为 12MB，两边必须对齐。
 MAX_BYTES = 12 * 1024 * 1024
-# 日志最多吃 40% 预算（按原始字节算；zip 压缩后通常只剩十分之一），其余留给图片
-LOG_RATIO = 0.40
-# 一局镜牢开始时日志里会出现这一行（module/decorator/decorator.py），从最后一次出现处开始截
+# 日志最多吃 50% 预算（按原始字节算；zip 压缩后通常只剩十分之一），其余留给图片
+LOG_RATIO = 0.50
+# 一局镜牢开始时日志里会出现这一行（module/decorator/decorator.py）；
+# 按预算尽量多带最近几局，避免「刚开下一局就点上传」把已完赛那局切掉
 RUN_START_MARKER = "开始执行 一次镜牢".encode("utf-8")
 # 截图张数：队伍先装（张数少，是核对人格的唯一依据），商店后装
 TEAM_CAPTURES = 2
-SHOP_CAPTURES = 3
+SHOP_CAPTURES = 5
 # 镜牢战绩 CSV：几 KB，无条件带（超长时只带尾部）
 RECORD_PATH = os.path.join("records", "mirror_runs.csv")
 RECORD_MAX_BYTES = 512 * 1024
@@ -76,11 +77,31 @@ def _newest_log_file() -> tuple[str, str] | None:
     return path, name
 
 
-def _slice_from_run_start(data: bytes) -> bytes:
-    """从最后一次「一局镜牢开始」处截断，丢掉启动前和上一局的日志。"""
-    start = data.rfind(RUN_START_MARKER)
-    if start < 0:
+def _run_start_indexes(data: bytes) -> list[int]:
+    """日志里所有「一局镜牢开始」标记的字节偏移，按出现顺序。"""
+    indexes = []
+    pos = data.find(RUN_START_MARKER)
+    while pos >= 0:
+        indexes.append(pos)
+        pos = data.find(RUN_START_MARKER, pos + 1)
+    return indexes
+
+
+def _slice_recent_runs(data: bytes, budget: int) -> bytes:
+    """从预算内最早的一局开头截起，尽量把刚打完的那局也带上。
+
+    只截最后一局的话，打完一局马上开了下一局再点上传，已完赛那局的日志
+    就会被整段切掉（2026-11-14 实测踩到）。这里从最后一局往前找，只要
+    这段还在预算内就把起点继续往前挪。
+    """
+    indexes = _run_start_indexes(data)
+    if not indexes:
         return data
+    start = indexes[-1]
+    for index in reversed(indexes):
+        if len(data) - index > budget:
+            break
+        start = index
     line_start = data.rfind(b"\n", 0, start) + 1
     return data[line_start:]
 
@@ -128,7 +149,7 @@ def _capture_candidates() -> list[tuple[str, str]]:
 def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
     """打一个 zip：一局镜牢的日志 + 战绩 CSV + 版本 + 备注 + 队伍/商店截图。
 
-    预算顺序：日志（最多 40%）→ 战绩 CSV / 版本 / 备注（几 KB）→ 队伍截图
+    预算顺序：日志（最多 50%）→ 战绩 CSV / 版本 / 备注（几 KB）→ 队伍截图
     → 商店截图。图片按顺序装到装不下为止，跳过了哪些、为什么跳过，都写进
     包内的 upload_manifest.txt，不再静默丢弃。
     """
@@ -144,7 +165,7 @@ def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
         with open(path, "rb") as f:
             raw = f.read()
         if RUN_START_MARKER in raw:
-            log_blob = _fit_log(_slice_from_run_start(raw), log_budget)
+            log_blob = _fit_log(_slice_recent_runs(raw, log_budget), log_budget)
         else:
             # 日志已经切过、本局起点在旧文件里时，退回「上传最新日志」
             log_blob = _fit_log(raw, log_budget)

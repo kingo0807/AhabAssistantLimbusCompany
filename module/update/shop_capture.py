@@ -17,7 +17,7 @@ import time
 from module.logger import log
 
 CAPTURE_DIR = os.path.join("logs", "captures")
-KEEP_SHOP = 3           # 商店截图本地最多留几张
+KEEP_SHOP = 5           # 商店截图本地最多留几张（一层一张，五层都留着）
 KEEP_TEAM = 2           # 队伍截图本地最多留几张
 MAX_WIDTH = 0           # 0 = 保留原始分辨率（标定/OCR 都要原图）
 SAVE_FORMAT = "PNG"     # 无损保存，不做有损压缩
