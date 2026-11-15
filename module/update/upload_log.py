@@ -25,9 +25,6 @@ from module.update.check_update import update_manifest_url
 MAX_BYTES = 12 * 1024 * 1024
 # 日志最多吃 50% 预算（按原始字节算；zip 压缩后通常只剩十分之一），其余留给图片
 LOG_RATIO = 0.50
-# 一局镜牢开始时日志里会出现这一行（module/decorator/decorator.py）；
-# 按预算尽量多带最近几局，避免「刚开下一局就点上传」把已完赛那局切掉
-RUN_START_MARKER = "开始执行 一次镜牢".encode("utf-8")
 # 截图张数：队伍先装（张数少，是核对人格的唯一依据），商店后装
 TEAM_CAPTURES = 2
 SHOP_CAPTURES = 5
@@ -77,35 +74,6 @@ def _newest_log_file() -> tuple[str, str] | None:
     return path, name
 
 
-def _run_start_indexes(data: bytes) -> list[int]:
-    """日志里所有「一局镜牢开始」标记的字节偏移，按出现顺序。"""
-    indexes = []
-    pos = data.find(RUN_START_MARKER)
-    while pos >= 0:
-        indexes.append(pos)
-        pos = data.find(RUN_START_MARKER, pos + 1)
-    return indexes
-
-
-def _slice_recent_runs(data: bytes, budget: int) -> bytes:
-    """从预算内最早的一局开头截起，尽量把刚打完的那局也带上。
-
-    只截最后一局的话，打完一局马上开了下一局再点上传，已完赛那局的日志
-    就会被整段切掉（2026-11-14 实测踩到）。这里从最后一局往前找，只要
-    这段还在预算内就把起点继续往前挪。
-    """
-    indexes = _run_start_indexes(data)
-    if not indexes:
-        return data
-    start = indexes[-1]
-    for index in reversed(indexes):
-        if len(data) - index > budget:
-            break
-        start = index
-    line_start = data.rfind(b"\n", 0, start) + 1
-    return data[line_start:]
-
-
 def _fit_log(data: bytes, budget: int) -> bytes:
     """超预算时保留头尾各一段：开头有 config/队伍信息，结尾是最新状态。"""
     if len(data) <= budget:
@@ -147,7 +115,7 @@ def _capture_candidates() -> list[tuple[str, str]]:
 
 
 def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
-    """打一个 zip：一局镜牢的日志 + 战绩 CSV + 版本 + 备注 + 队伍/商店截图。
+    """打一个 zip：当前整份日志 + 战绩 CSV + 版本 + 备注 + 队伍/商店截图。
 
     预算顺序：日志（最多 50%）→ 战绩 CSV / 版本 / 备注（几 KB）→ 队伍截图
     → 商店截图。图片按顺序装到装不下为止，跳过了哪些、为什么跳过，都写进
@@ -164,13 +132,12 @@ def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
         path, log_name = newest
         with open(path, "rb") as f:
             raw = f.read()
-        if RUN_START_MARKER in raw:
-            log_blob = _fit_log(_slice_recent_runs(raw, log_budget), log_budget)
-        else:
-            # 日志已经切过、本局起点在旧文件里时，退回「上传最新日志」
-            log_blob = _fit_log(raw, log_budget)
-            manifest.append("注意：日志里没找到『开始执行 一次镜牢』，本次上传最新日志（可能是切过文件的旧局）")
+        # debugLog.log 按 5MB 轮转，50% 预算（6MB）足够装下整个当前文件。
+        # 不再按「一局开始」标记截：标记不一定在文件里，截了反而会把已完赛那局丢掉。
+        log_blob = _fit_log(raw, log_budget)
         manifest.append(f"logs/{log_name}\t{len(log_blob)} bytes (原文件 {len(raw)} bytes)")
+        first_line = raw.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+        manifest.append(f"日志首行\t{first_line[:160]}")
 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         if log_name:
