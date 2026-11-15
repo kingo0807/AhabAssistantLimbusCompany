@@ -232,8 +232,9 @@ class Mirror:
                 break
 
     def run(self):
-        # 本次运行的开始时间
+        # 本次运行的开始时间（战败重开后会重置，保证整局耗时只算当前这一局）
         run_start_time = time.time()
+        self.run_start_time = run_start_time
 
         if auto.click_element("home/drive_assets.png") or auto.find_element("home/window_assets.png"):
             sleep(0.5)
@@ -321,9 +322,14 @@ class Mirror:
                     main_loop_count += 50
                 continue
 
+            # 不在卡包页：下一次再看到卡包页就是新的一层。
+            # 不再依赖「地图页」那张图的识别结果来复位——它偶尔认不出来，
+            # 会让后面几层的卡包页都不算新楼层，层计时和记录整段丢掉。
+            theme_pack_active = False
+
             # 中途启动时从脚本启动时刻计时；准备页面会清除此记录，等卡包页开始完整计时。
             if self.current_floor_start_time is None and not preparing:
-                self.current_floor_start_time = run_start_time
+                self.current_floor_start_time = self.run_start_time
 
             # 遇到选择增益事件（少见）
             if auto.click_element("mirror/road_in_mir/event_effect_button.png", threshold=0.75):
@@ -712,7 +718,7 @@ class Mirror:
             return False
         # 计时结束
         end_time = time.time()
-        elapsed_time = end_time - run_start_time
+        elapsed_time = end_time - self.run_start_time
 
         if self.theme_pack_timing_start_count == 5:  # 五层都从卡包页开始计时，才更新完整一轮的耗时历史。
             team = cfg.config.teams.get(f"{self.team_order}")
@@ -766,9 +772,8 @@ class Mirror:
                 log.warning(f"无法找到编队{self.team_number}的历史记录，无法更新数据")
             log.debug(team_history)
 
-        # 从领奖页中途启动时，同样输出启动后这一段不完整的耗时。
-        if self.current_floor_start_time is None:
-            self.current_floor_start_time = run_start_time
+        # 收尾只记录真正在计时的最后一层；没有计时就不伪造。
+        # 以前这里会回填成开局时间，导致最后一层的「层秒」永远等于整局秒。
         self._log_floor_time(end_time, self.floor)
 
         # 追加本局每层耗时到 records/mirror_runs.csv，失败只记日志不影响跑图
@@ -1261,6 +1266,8 @@ class Mirror:
         log.info(msg)
         self.first_battle = True
         self.start_time = time.time()
+        # 重开后整局耗时应从重开的这一刻算起，而不是把战败那局也算进去
+        self.run_start_time = time.time()
         self.floor = 0
         self.pack_by_floor = {}
         self.floor_records = []
