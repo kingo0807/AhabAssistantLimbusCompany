@@ -1266,8 +1266,13 @@ class Mirror:
         log.info(msg)
         self.first_battle = True
         self.start_time = time.time()
-        # 重开后整局耗时应从重开的这一刻算起，而不是把战败那局也算进去
+        # 重开后整局耗时和各阶段耗时都只算重开后的这一局，避免出现「战斗秒 > 整局秒」
         self.run_start_time = time.time()
+        self.battle_total_time = 0
+        self.event_total_time = 0
+        self.shop_total_time = 0
+        self.find_road_total_time = 0
+        self.event_times = 0
         self.floor = 0
         self.pack_by_floor = {}
         self.floor_records = []
