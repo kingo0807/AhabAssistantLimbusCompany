@@ -23,11 +23,13 @@ from module.update.check_update import update_manifest_url
 # 仍然直连局域网 NanoKVM Go（不走 Cloudflare 隧道），上限放宽到 12MB。
 # 设备端 aalc-serve.py 的 MAX_BYTES 同为 12MB，两边必须对齐。
 MAX_BYTES = 12 * 1024 * 1024
-# 日志部分上限：当前文件整份 + 上一份轮转日志的尾巴（原始字节）。
+# 日志部分上限：当前文件整份 + 上一份轮转日志的最后一局（原始字节）。
 # debugLog.log 按 5MB 切，跑图中途切过一次就只剩后半段，开局要从 .1 里捞；
-# 文本压缩率高，8MB 原始日志进 zip 后通常不到 1MB，不会挤掉截图。
-LOG_MAX_BYTES = 8 * 1024 * 1024
-BACKUP_LOG_MAX_BYTES = 3 * 1024 * 1024
+# 文本压缩率高，10MB 原始日志进 zip 后通常只有 1MB 左右，不会挤掉截图。
+LOG_MAX_BYTES = 10 * 1024 * 1024
+BACKUP_LOG_MAX_BYTES = 5 * 1024 * 1024
+# 一局镜牢开始时日志里会出现这一行（module/decorator/decorator.py）
+RUN_START_MARKER = "开始执行 一次镜牢".encode("utf-8")
 # 截图张数：队伍先装（张数少，是核对人格的唯一依据），商店后装
 TEAM_CAPTURES = 2
 SHOP_CAPTURES = 5
@@ -105,6 +107,19 @@ def _read_records() -> bytes:
         return b""
 
 
+def _slice_backup_log(data: bytes) -> bytes:
+    """上一份日志只带最后一局：从最后一次「开始执行 一次镜牢」截到文件尾。
+
+    跑图跨轮转时，一局的起点就在 .1 里；这样截能保证起点一定被带上。
+    找不到标记（起点也在更早的文件里）时退回整份，由调用方按预算截尾。
+    """
+    start = data.rfind(RUN_START_MARKER)
+    if start < 0:
+        return data
+    line_start = data.rfind(b"\n", 0, start) + 1
+    return data[line_start:]
+
+
 def _capture_candidates() -> list[tuple[str, str]]:
     """[(路径, zip 内文件名)]：队伍截图在前、商店截图在后，各自最新的优先。"""
     try:
@@ -133,31 +148,34 @@ def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
     backup_blob = b""
     backup_name = ""
     backup_size = 0
-    log_budget = min(LOG_MAX_BYTES, max(64 * 1024, int(max_bytes * 0.66)))
+    log_budget = min(LOG_MAX_BYTES, max(64 * 1024, int(max_bytes * 0.85)))
     if newest is not None:
         path, log_name = newest
         with open(path, "rb") as f:
             raw = f.read()
-        # 当前文件整份带；debugLog.log 按 5MB 轮转，8MB 日志预算装得下。
+        # 当前文件整份带；debugLog.log 按 5MB 轮转，10MB 日志预算装得下。
         # 不再按「一局开始」标记截：标记不一定在当前文件里，截了反而会把已完赛那局丢掉。
         log_blob = _fit_log(raw, log_budget)
-        # 轮转过的上一份只带尾部：跑图中途切过文件时，开局那段在 .1 里。
+        # 上一份日志从最后一局开头截起：跑图跨轮转时，开局那段在 .1 里。
         rest = log_budget - len(log_blob)
         if rest > 64 * 1024:
             backup_path = path + ".1"
             try:
                 if os.path.isfile(backup_path):
                     backup_size = os.path.getsize(backup_path)
-                    take = min(rest, BACKUP_LOG_MAX_BYTES, backup_size)
                     with open(backup_path, "rb") as f:
-                        f.seek(backup_size - take)
-                        backup_blob = f.read()
+                        backup_raw = f.read()
+                    backup_blob = _slice_backup_log(backup_raw)
+                    limit = max(64 * 1024, min(rest, BACKUP_LOG_MAX_BYTES))
+                    if len(backup_blob) > limit:
+                        backup_blob = backup_blob[-limit:]
                     backup_name = log_name + ".1.tail"
             except OSError as e:
                 log.debug(f"读取上一份日志失败（已忽略）: {e}")
         if backup_blob:
             manifest.append(
-                f"logs/{backup_name}\t{len(backup_blob)} bytes (上一份日志 {backup_size} bytes 的尾部)"
+                f"logs/{backup_name}\t{len(backup_blob)} bytes "
+                f"(上一份日志 {backup_size} bytes，从最后一局开头截到文件尾)"
             )
         manifest.append(f"logs/{log_name}\t{len(log_blob)} bytes (原文件 {len(raw)} bytes)")
         first_line = raw.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
