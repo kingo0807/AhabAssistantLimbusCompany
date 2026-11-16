@@ -23,8 +23,11 @@ from module.update.check_update import update_manifest_url
 # 仍然直连局域网 NanoKVM Go（不走 Cloudflare 隧道），上限放宽到 12MB。
 # 设备端 aalc-serve.py 的 MAX_BYTES 同为 12MB，两边必须对齐。
 MAX_BYTES = 12 * 1024 * 1024
-# 日志最多吃 50% 预算（按原始字节算；zip 压缩后通常只剩十分之一），其余留给图片
-LOG_RATIO = 0.50
+# 日志部分上限：当前文件整份 + 上一份轮转日志的尾巴（原始字节）。
+# debugLog.log 按 5MB 切，跑图中途切过一次就只剩后半段，开局要从 .1 里捞；
+# 文本压缩率高，8MB 原始日志进 zip 后通常不到 1MB，不会挤掉截图。
+LOG_MAX_BYTES = 8 * 1024 * 1024
+BACKUP_LOG_MAX_BYTES = 3 * 1024 * 1024
 # 截图张数：队伍先装（张数少，是核对人格的唯一依据），商店后装
 TEAM_CAPTURES = 2
 SHOP_CAPTURES = 5
@@ -115,11 +118,11 @@ def _capture_candidates() -> list[tuple[str, str]]:
 
 
 def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
-    """打一个 zip：当前整份日志 + 战绩 CSV + 版本 + 备注 + 队伍/商店截图。
+    """打一个 zip：当前整份日志 + 上一份日志尾巴 + 战绩 CSV + 版本 + 备注 + 截图。
 
-    预算顺序：日志（最多 50%）→ 战绩 CSV / 版本 / 备注（几 KB）→ 队伍截图
-    → 商店截图。图片按顺序装到装不下为止，跳过了哪些、为什么跳过，都写进
-    包内的 upload_manifest.txt，不再静默丢弃。
+    预算顺序：日志（当前 + 上一份尾巴，最多 8MB）→ 战绩 CSV / 版本 / 备注（几 KB）
+    → 队伍截图 → 商店截图。图片按顺序装到装不下为止，跳过了哪些、为什么跳过，
+    都写进包内的 upload_manifest.txt，不再静默丢弃。
     """
     buf = io.BytesIO()
     manifest: list[str] = []
@@ -127,19 +130,42 @@ def collect_logs(max_bytes: int = MAX_BYTES, note: str = "") -> bytes:
     newest = _newest_log_file()
     log_blob = b""
     log_name = ""
-    log_budget = max(64 * 1024, int(max_bytes * LOG_RATIO))
+    backup_blob = b""
+    backup_name = ""
+    backup_size = 0
+    log_budget = min(LOG_MAX_BYTES, max(64 * 1024, int(max_bytes * 0.66)))
     if newest is not None:
         path, log_name = newest
         with open(path, "rb") as f:
             raw = f.read()
-        # debugLog.log 按 5MB 轮转，50% 预算（6MB）足够装下整个当前文件。
-        # 不再按「一局开始」标记截：标记不一定在文件里，截了反而会把已完赛那局丢掉。
+        # 当前文件整份带；debugLog.log 按 5MB 轮转，8MB 日志预算装得下。
+        # 不再按「一局开始」标记截：标记不一定在当前文件里，截了反而会把已完赛那局丢掉。
         log_blob = _fit_log(raw, log_budget)
+        # 轮转过的上一份只带尾部：跑图中途切过文件时，开局那段在 .1 里。
+        rest = log_budget - len(log_blob)
+        if rest > 64 * 1024:
+            backup_path = path + ".1"
+            try:
+                if os.path.isfile(backup_path):
+                    backup_size = os.path.getsize(backup_path)
+                    take = min(rest, BACKUP_LOG_MAX_BYTES, backup_size)
+                    with open(backup_path, "rb") as f:
+                        f.seek(backup_size - take)
+                        backup_blob = f.read()
+                    backup_name = log_name + ".1.tail"
+            except OSError as e:
+                log.debug(f"读取上一份日志失败（已忽略）: {e}")
+        if backup_blob:
+            manifest.append(
+                f"logs/{backup_name}\t{len(backup_blob)} bytes (上一份日志 {backup_size} bytes 的尾部)"
+            )
         manifest.append(f"logs/{log_name}\t{len(log_blob)} bytes (原文件 {len(raw)} bytes)")
         first_line = raw.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
         manifest.append(f"日志首行\t{first_line[:160]}")
 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if backup_blob:
+            zf.writestr("logs/" + backup_name, backup_blob)
         if log_name:
             zf.writestr("logs/" + log_name, log_blob)
 
