@@ -327,6 +327,10 @@ class Mirror:
             # 会让后面几层的卡包页都不算新楼层，层计时和记录整段丢掉。
             theme_pack_active = False
 
+            # 下面几个都是开局准备阶段的界面；跑图开始后不再响应，
+            # 否则战斗里的流血/燃烧图标会误匹配观测饰品，把层计时清掉、还会乱点鼠标。
+            prepare_only = self.theme_pack_timing_start_count == 0
+
             # 中途启动时从脚本启动时刻计时；准备页面会清除此记录，等卡包页开始完整计时。
             if self.current_floor_start_time is None and not preparing:
                 self.current_floor_start_time = self.run_start_time
@@ -374,7 +378,7 @@ class Mirror:
                 continue
 
             # 选择镜牢队伍
-            if auto.find_element("mirror/road_to_mir/select_team_stars_assets.png"):
+            if prepare_only and auto.find_element("mirror/road_to_mir/select_team_stars_assets.png"):
                 preparing = True
                 self.current_floor_start_time = None
                 self.select_mirror_team()
@@ -445,7 +449,7 @@ class Mirror:
                 continue
 
             # 镜牢星光
-            if auto.find_element("mirror/road_to_mir/dreaming_star/coins_assets.png",model="normal"):
+            if prepare_only and auto.find_element("mirror/road_to_mir/dreaming_star/coins_assets.png",model="normal"):
                 preparing = True
                 self.current_floor_start_time = None
                 self.enter_mir_with_star()
@@ -505,16 +509,19 @@ class Mirror:
                 continue
 
             # 初始饰品选择
-            if auto.find_element("mirror/road_to_mir/activate_gift_search_on_assets.png") or auto.find_element(
-                "mirror/road_to_mir/activate_gift_search_off_assets.png"
+            if prepare_only and (
+                auto.find_element("mirror/road_to_mir/activate_gift_search_on_assets.png")
+                or auto.find_element("mirror/road_to_mir/activate_gift_search_off_assets.png")
             ):
                 preparing = True
                 self.current_floor_start_time = None
                 self.select_init_ego_gift()
                 continue
 
-            if auto.find_element("mirror/road_to_mir/observe_ego_gift/bleed.png",my_crop=self.observe_bbox) or auto.find_element(
-                    "mirror/road_to_mir/observe_ego_gift/burn.png",my_crop=self.observe_bbox):
+            if prepare_only and (
+                auto.find_element("mirror/road_to_mir/observe_ego_gift/bleed.png", my_crop=self.observe_bbox)
+                or auto.find_element("mirror/road_to_mir/observe_ego_gift/burn.png", my_crop=self.observe_bbox)
+            ):
                 preparing = True
                 self.current_floor_start_time = None
                 self.select_observe_ego_gift()
