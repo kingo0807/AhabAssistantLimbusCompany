@@ -64,6 +64,11 @@ class Shop:
         self.the_first_line_position = None
         self.replacement = 0
 
+        # 商店购买记账：日志里要能看出买了什么、花了多少、还剩多少
+        self._shop_money = -1   # 上一次读到的余额
+        self._shop_bought = 0   # 本次商店买了几件
+        self._shop_spent = 0    # 本次商店一共花了多少
+
         # 用于记录已升级的ego饰品
         self.enhance_gifts_list = []
         self.first_gift_enhance = False
@@ -97,6 +102,53 @@ class Shop:
             if loop_count < 0:
                 log.error("无法升级ego饰品")
                 break
+
+    def _log_shop_spend(self, action, is_buy=True):
+        """记一行资金流水：动作、前后余额、这次花了多少。
+
+        余额用和刷新判断同一个 `_get_cost()` 读，花费按「上一次余额 - 现在余额」算，所以不需要
+        知道商品价格。刚点完确认时可能还没扣款，余额会和上次相同——等 1 秒再读一次；两次都没变
+        就认为这次没成交，不写记录。读不到余额时仍记一笔「买到了」，只是没有价钱。
+        `is_buy=False` 表示刷新：计入本店总花费，但不计入购买件数。
+        """
+
+        def read_money(times):
+            for _ in range(times):
+                while auto.take_screenshot() is None:
+                    continue
+                value = self._get_cost()
+                if value >= 0:
+                    return value
+                sleep(1)
+            return -1
+
+        money = read_money(3)
+        last = self._shop_money
+        if money >= 0 and last >= 0 and money == last:
+            sleep(1)
+            again = read_money(1)
+            if again >= 0:
+                money = again
+
+        bought = 1 if is_buy else 0
+        if money < 0:
+            self._shop_bought += bought
+            log.info(f"[商店] {action}（余额读取失败，未计入花费）")
+            return
+        if last < 0:
+            self._shop_bought += bought
+            self._shop_money = money
+            log.info(f"[商店] {action} 余额 {money}")
+            return
+        spent = last - money
+        if spent > 0:
+            self._shop_bought += bought
+            self._shop_spent += spent
+            self._shop_money = money
+            log.info(f"[商店] {action} {last}->{money} (-{spent})")
+        elif spent < 0:
+            # 余额反而变多（进层收益/刷新后重排），只把基准更新掉，不当作消费
+            self._shop_money = money
 
     def buy_gifts(self):
         def sort_points(points, complete=0, threshold=40):
@@ -143,6 +195,32 @@ class Shop:
             return new_points
 
         log.debug("开始执行饰品购买模块")
+        # 本次商店的记账起点：进场余额 + 计数器（离店时汇总一行）
+        self._shop_money = self._get_cost()
+        self._shop_bought = 0
+        self._shop_spent = 0
+        # 本店展出的栏位数（3~7 浮动：星之恩惠的「商店里展出的 E.G.O 饰品数量 +1/+2」会加），
+        # 刷新概率模型要按真实栏位算。金币图标在商品卡片、余额、刷新按钮上都有，
+        # 所以只数落在商品区（画面中右侧）的那些，并把总命中数一起打出来，方便事后按截图校准。
+        try:
+            _shot = auto.take_screenshot()
+            _coins = auto.find_element(
+                "mirror/shop/shop_coins_assets.png",
+                find_type="image_with_multiple_targets",
+                take_screenshot=False,
+            ) or []
+            if _shot is not None:
+                _w, _h = _shot.size
+            else:
+                _w, _h = cfg.set_win_size, cfg.set_win_size * 9 / 16
+            _slots = sum(
+                1
+                for _p in _coins
+                if 0.40 * _w <= _p[0] <= 0.90 * _w and 0.25 * _h <= _p[1] <= 0.75 * _h
+            )
+            log.info(f"[商店] 栏位={_slots}（金币图标命中 {len(_coins)} 个）")
+        except Exception:
+            log.info("[商店] 栏位=未知")
         keyword_refresh_count = 0
         normal_refresh_count = 0
         complete_count = 0
@@ -179,6 +257,7 @@ class Shop:
                         )
                         while auto.take_screenshot() is None:
                             continue
+                        self._log_shop_spend(f"必买项 {str(commodity).rsplit('/', 1)[-1]}")
 
             if self.fuse_aggressive_switch:
                 log.debug("开始购买强化素材")
@@ -197,6 +276,7 @@ class Shop:
                                 raise self.RestartGame()
                             auto.click_element("mirror/road_in_mir/ego_gift_get_confirm_assets.png")
                             complete_count += 1
+                            self._log_shop_spend("强化素材 IV")
                             continue
                         else:
                             auto.mouse_click_blank()
@@ -212,6 +292,7 @@ class Shop:
                                 take_screenshot=True,
                             )
                             complete_count += 1
+                            self._log_shop_spend("强化素材 III")
                             continue
                         else:
                             auto.mouse_click_blank()
@@ -245,6 +326,7 @@ class Shop:
                             take_screenshot=True,
                         )
                         complete_count += 1
+                        self._log_shop_spend(f"本体系饰品 {self.system}")
                         system_gift = re_sort_points(system_gift)
                         auto.mouse_click_blank(times=3)
                         continue
@@ -279,6 +361,7 @@ class Shop:
                                 take_screenshot=True,
                             )
                             complete_count += 1
+                            self._log_shop_spend(f"第二体系饰品 {self.second_system_select}")
                             system_gift = re_sort_points(system_gift)
                             auto.mouse_click_blank(times=3)
                             continue
@@ -292,6 +375,9 @@ class Shop:
                 raise self.RestartGame()
 
             my_remaining_money = self._get_cost()
+            if my_remaining_money >= 0:
+                # 让记账基准跟上（刷新、技能替换也会花钱，都在这之后发生）
+                self._shop_money = my_remaining_money
 
             if my_remaining_money < 0:
                 log.warning("无法读取剩余金钱，跳过本次刷新")
@@ -328,6 +414,7 @@ class Shop:
                     sleep(3)
                     if retry() is False:
                         raise self.RestartGame()
+                    self._log_shop_spend("关键词刷新", is_buy=False)
                     if self.skill_replacement and self.replacement < 3:
                         self.replacement_skill()
                     continue
@@ -339,11 +426,16 @@ class Shop:
                     sleep(3)
                     if retry() is False:
                         raise self.RestartGame()
+                    self._log_shop_spend("普通刷新", is_buy=False)
                     if self.skill_replacement and self.replacement < 3:
                         self.replacement_skill()
                     continue
 
             break
+
+        log.info(
+            f"本次商店：购买 {self._shop_bought} 件，本店共花 {self._shop_spent}（含刷新），余额 {self._shop_money}"
+        )
 
     def fuse_useless_gifts_aggressive(self):
         """合成无用饰品_激进版"""

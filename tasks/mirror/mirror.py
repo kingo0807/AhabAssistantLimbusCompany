@@ -4,6 +4,7 @@ from time import sleep
 
 import numpy as np
 
+from module import VERSION_PATH
 from module.automation import auto
 from module.config import TeamSetting, cfg
 from module.decorator.decorator import begin_and_finish_time_log
@@ -45,6 +46,15 @@ def to_log_with_time(msg, elapsed_time):
     minutes, seconds = divmod(remainder, 60)
     time_string = f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
     log.info(f"{msg} 总耗时:{time_string}")
+
+
+def _read_aalc_version():
+    """读安装目录里的版本号，读不到就返回「未知」。"""
+    try:
+        with open(VERSION_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip() or "未知"
+    except Exception:
+        return "未知"
 
 
 class Mirror:
@@ -143,6 +153,8 @@ class Mirror:
 
     def _enter_hard_mode_if_needed(self):
         if self.normal_to_hard_floor > 0 and self.floor >= self.normal_to_hard_floor:
+            if not self.hard_mode:
+                log.info(f"[镜牢] 第{self.floor}层起切换为困难模式")
             self.hard_mode = True
             self.mirror_map.hard_mode = True
             if self.floor == 1:
@@ -235,6 +247,14 @@ class Mirror:
         # 本次运行的开始时间（战败重开后会重置，保证整局耗时只算当前这一局）
         run_start_time = time.time()
         self.run_start_time = run_start_time
+
+        # 每局开头记一行口径：模式 / 队伍 / 体系 / 备注 / 版本，事后看日志不用再猜
+        _team_now = cfg.config.teams.get(f"{self.team_order}")
+        log.info(
+            f"[镜牢] 开始 模式={'困难' if self.hard_mode else '普通'} 队伍={self.team_order} "
+            f"体系={self.system} 备注={getattr(_team_now, 'remark_name', '') or ''} "
+            f"版本={_read_aalc_version()}"
+        )
 
         if auto.click_element("home/drive_assets.png") or auto.find_element("home/window_assets.png"):
             sleep(0.5)
