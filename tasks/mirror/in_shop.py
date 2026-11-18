@@ -150,7 +150,38 @@ class Shop:
             # 余额反而变多（进层收益/刷新后重排），只把基准更新掉，不当作消费
             self._shop_money = money
 
+    def _log_shelf_names(self):
+        """观测用：按固定 4x2 网格读货架名字，打一行日志核对 OCR 准确率。
+
+        坐标是 1280x720 实测比例（商品区 x 570~1250 / y 210~500，名字条在格子底部约 20%），
+        按当前截图尺寸等比缩放。**不参与任何购买决策**，失败只记 debug。
+        """
+        if auto.screenshot is None:
+            return
+        w, h = auto.screenshot.size
+        x0, y0 = 0.445 * w, 0.292 * h
+        cell_w = 0.531 * w / 4
+        cell_h = 0.403 * h / 2
+        for r in range(2):
+            for c in range(4):
+                slot = r * 4 + c
+                bx0 = int(x0 + c * cell_w)
+                by0 = int(y0 + r * cell_h + 0.80 * cell_h)
+                bx1 = int(bx0 + cell_w)
+                by1 = int(by0 + 0.20 * cell_h)
+                if bx0 < 0 or by0 < 0 or bx1 > w or by1 > h:
+                    continue
+                texts = auto.get_text_from_screenshot((bx0, by0, bx1, by1)) or []
+                name = "".join(t.strip() for t in texts).replace(" ", "")
+                log.info(f"[商店] 商品 slot={slot} 名字={name if name else '空'}")
+
     def buy_gifts(self):
+        # 观测：读一次货架名字（只为核对 OCR 准确率，不参与购买决策）
+        try:
+            self._log_shelf_names()
+        except Exception as e:
+            log.debug(f"读货架名字失败（已忽略）: {type(e).__name__}: {e}")
+
         def sort_points(points, complete=0, threshold=40):
             # 第一步：先按 X 坐标排好（左右顺序）
             points.sort(key=lambda p: p[0])
@@ -199,6 +230,9 @@ class Shop:
         self._shop_money = self._get_cost()
         self._shop_bought = 0
         self._shop_spent = 0
+        # 进场余额单独记一行：原来只有 debug 的「剩余金钱」，不买东西的店就没有基准，
+        # 商店的收入 / 通货膨胀曲线会断档
+        log.info(f"[商店] 进场 余额={self._shop_money if self._shop_money >= 0 else '未知'}")
         # 本店展出的栏位数（3~7 浮动：星之恩惠的「商店里展出的 E.G.O 饰品数量 +1/+2」会加），
         # 刷新概率模型要按真实栏位算。金币图标在商品卡片、余额、刷新按钮上都有，
         # 所以只数落在商品区（画面中右侧）的那些，并把总命中数一起打出来，方便事后按截图校准。
@@ -417,6 +451,7 @@ class Shop:
                     self._log_shop_spend("关键词刷新", is_buy=False)
                     if self.skill_replacement and self.replacement < 3:
                         self.replacement_skill()
+                        self._log_shop_spend("技能替换", is_buy=False)
                     continue
 
             if normal_refresh_count < self.max_normal_refresh and my_remaining_money >= 200:
@@ -429,6 +464,7 @@ class Shop:
                     self._log_shop_spend("普通刷新", is_buy=False)
                     if self.skill_replacement and self.replacement < 3:
                         self.replacement_skill()
+                        self._log_shop_spend("技能替换", is_buy=False)
                     continue
 
             break
