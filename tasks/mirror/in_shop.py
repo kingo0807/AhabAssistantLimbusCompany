@@ -162,12 +162,15 @@ class Shop:
         x0, y0 = 0.445 * w, 0.292 * h
         cell_w = 0.531 * w / 4
         cell_h = 0.403 * h / 2
+        # 每格左右各收 8%：初版裁满整格时会把邻格的字也读进来
+        # （实测「采血包地」「齿轮发条1B」「刺棘之路荆束」都是右侧溢入）
+        pad_x = 0.08 * cell_w
         for r in range(2):
             for c in range(4):
                 slot = r * 4 + c
-                bx0 = int(x0 + c * cell_w)
+                bx0 = int(x0 + c * cell_w + pad_x)
                 by0 = int(y0 + r * cell_h + 0.80 * cell_h)
-                bx1 = int(bx0 + cell_w)
+                bx1 = int(bx0 + cell_w - 2 * pad_x)
                 by1 = int(by0 + 0.20 * cell_h)
                 if bx0 < 0 or by0 < 0 or bx1 > w or by1 > h:
                     continue
