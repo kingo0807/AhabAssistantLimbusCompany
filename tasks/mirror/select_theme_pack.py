@@ -120,6 +120,9 @@ def select_theme_pack(hard_mode=False, floor=None, team_num=None, use_custom_the
                     sleep(3)
                     msg = f"此次选择卡包关键词：{pack_name[max_index]}"
                     log.info(msg)
+                    # 同屏候选一起记下来（只记名字，不记权重）：调权重要知道「没被选中的本来是哪些」
+                    _floor_tag = f"第{floor}层" if floor else "楼层未知"
+                    log.info(f"[镜牢] {_floor_tag} 选包 候选={','.join(pack_name)} 选中={pack_name[max_index]}")
                     return pack_name[max_index]
 
         except Exception as e:
@@ -146,6 +149,8 @@ def select_theme_pack(hard_mode=False, floor=None, team_num=None, use_custom_the
                 log.debug("无匹配最低阈值的主题包，选择最高权重主题包")
                 msg = f"无匹配最低阈值的主题包，选择最高权重主题包\n此次选择卡包关键词：{pack_name[max_index]}"
                 log.info(msg)
+                _floor_tag = f"第{floor}层" if floor else "楼层未知"
+                log.info(f"[镜牢] {_floor_tag} 选包 候选={','.join(pack_name)} 选中={pack_name[max_index]}")
                 return pack_name[max_index]
             except Exception as e:
                 log.error(f"选择主题包出错:{e},尝试回到初始界面")
