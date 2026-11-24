@@ -151,27 +151,27 @@ class Shop:
             self._shop_money = money
 
     def _log_shelf_names(self):
-        """观测用：按固定 4x2 网格读货架名字，打一行日志核对 OCR 准确率。
+        """观测用：按 3 列固定网格读货架名字，打一行日志核对 OCR 准确率。
 
-        坐标是 1280x720 实测比例（商品区 x 570~1250 / y 210~500，名字条在格子底部约 20%），
-        按当前截图尺寸等比缩放。**不参与任何购买决策**，失败只记 debug。
+        坐标取自 2026-11-23 的真实商店截图（1280x720）：
+        商品区 **3 列**（不是 4 列），列距 170 px，首列左边缘 x=545，名字条在卡片底部
+        （y 320~345）、条宽约 115 px；最多 7 个商品（3 列 x 3 行）。
+        **不参与任何购买决策**，失败只记 debug。
         """
         if auto.screenshot is None:
             return
         w, h = auto.screenshot.size
-        x0, y0 = 0.445 * w, 0.292 * h
-        cell_w = 0.531 * w / 4
-        cell_h = 0.403 * h / 2
-        # 每格左右各收 8%：初版裁满整格时会把邻格的字也读进来
-        # （实测「采血包地」「齿轮发条1B」「刺棘之路荆束」都是右侧溢入）
-        pad_x = 0.08 * cell_w
-        for r in range(2):
-            for c in range(4):
-                slot = r * 4 + c
-                bx0 = int(x0 + c * cell_w + pad_x)
-                by0 = int(y0 + r * cell_h + 0.80 * cell_h)
-                bx1 = int(bx0 + cell_w - 2 * pad_x)
-                by1 = int(by0 + 0.20 * cell_h)
+        x0, y0 = 0.426 * w, 0.292 * h      # 545/1280, 210/720
+        cell_w = 0.133 * w                 # 170/1280 列距
+        cell_h = 0.236 * h                 # 170/720 行距（不是 145，实测第二行在 y≈380）
+        name_w = 0.098 * w                 # 125/1280，名字条宽度（8 字名「替换李箱的技能」要 125 才够）
+        for r in range(3):
+            for c in range(3):
+                slot = r * 3 + c
+                bx0 = int(x0 + c * cell_w)
+                by0 = int(y0 + r * cell_h + 0.68 * cell_h)    # 名字条顶部（第一行 y≈326）
+                bx1 = int(bx0 + name_w)
+                by1 = int(by0 + 0.17 * cell_h)                # 名字条高 ≈29 px
                 if bx0 < 0 or by0 < 0 or bx1 > w or by1 > h:
                     continue
                 texts = auto.get_text_from_screenshot((bx0, by0, bx1, by1)) or []
