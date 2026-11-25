@@ -103,7 +103,16 @@ def select_theme_pack(hard_mode=False, floor=None, team_num=None, use_custom_the
                         theme_pack_name = result.text
                     else:
                         theme_pack_weight = unknown_weight
-                        theme_pack_name = "unknown"
+                        # R-004：把 OCR 原文带上。否则事后只看到一个 unknown，
+                        # 没法判断是「这个包本来不在表里」还是「OCR 读歪了」。
+                        # 原文里的逗号换成顿号，避免破坏 M6 「候选=A,B,C」的逗号分隔。
+                        raw = ""
+                        try:
+                            texts = auto.get_text_from_screenshot(crop) or []
+                            raw = "".join(t.strip() for t in texts).replace(" ", "").replace(",", "、")
+                        except Exception:
+                            raw = ""
+                        theme_pack_name = f"unknown(原文={raw})" if raw else "unknown"
 
                     weight_list.append(theme_pack_weight)  # 采用最大值的形式，权重越大，优先级越高
                     pack_name.append(theme_pack_name)
