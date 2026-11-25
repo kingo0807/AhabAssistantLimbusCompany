@@ -169,8 +169,9 @@ def prune(dest: Path, keep: int) -> None:
     for version in ordered[keep:]:
         for path in versions[version]:
             path.unlink(missing_ok=True)
-        for suffix in (".patch.7z", ".patch.json"):
-            (dest / f"AALC_{version}{suffix}").unlink(missing_ok=True)
+        # 补丁文件名有两种：AALC_<v>.patch.7z / .patch.json 和 AALC_<v>.patch.from-<base>.7z
+        for stale in dest.glob(f"AALC_{version}.patch*"):
+            stale.unlink(missing_ok=True)
         log(f"清理旧版本：{version}")
     for stale in dest.glob(".aalc-sync-tmp*"):
         if stale.is_dir():
@@ -231,33 +232,62 @@ def run(args) -> int:
                 raise RuntimeError(f"{full_name} 大小不一致：{actual_size} != {expected_size}")
             log(f"{full_name} 校验通过")
 
-        # 补丁包：拿不到或校验不过就剥掉 incremental，让客户端用全量包
-        incremental = data.get("incremental")
-        patch_ok = False
-        if isinstance(incremental, dict) and incremental.get("url"):
-            patch_name = f"AALC_{version}.patch.7z"
-            meta_name = f"AALC_{version}.patch.json"
-            try:
-                meta_path = tmp / meta_name
-                fetch_asset(args.repo, tag, meta_name, meta_path, proxies, timeout=120)
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                fetch_asset(args.repo, tag, patch_name, tmp / patch_name, proxies, timeout=args.timeout)
-                actual = sha256_file(tmp / patch_name)
-                expected = str(meta.get("patch_sha256") or "")
-                if not expected or actual != expected:
-                    raise RuntimeError(f"{patch_name} sha256 不一致")
-                patch_ok = True
-                log(f"{patch_name} 校验通过")
-            except Exception as exc:
-                log(f"补丁同步失败，剥掉 incremental 块：{exc!r}")
+        # 补丁包：清单里带 incremental_list（多基线）就逐个拉取校验，失败的从清单里剥掉；
+        # 老清单只有 incremental 字典，走原来的单补丁逻辑。
+        patch_names: list[str] = []
+        entries = data.get("incremental_list")
+        if isinstance(entries, list) and entries:
+            kept: list[dict] = []
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("url") or "").rsplit("/", 1)[-1]
+                expected = str(item.get("sha256") or "")
+                expected_size = int(item.get("size") or 0)
+                if not name or not expected:
+                    continue
+                try:
+                    fetch_asset(args.repo, tag, name, tmp / name, proxies, timeout=args.timeout)
+                    actual = sha256_file(tmp / name)
+                    if actual != expected:
+                        raise RuntimeError(f"sha256 不一致：{actual} != {expected}")
+                    if expected_size and (tmp / name).stat().st_size != expected_size:
+                        raise RuntimeError("大小不一致")
+                    kept.append(item)
+                    patch_names.append(name)
+                    log(f"{name} 校验通过（基线 {item.get('base_version')}）")
+                except Exception as exc:
+                    log(f"{name} 同步失败，从清单里剥掉：{exc!r}")
+            data["incremental_list"] = kept
+            primary = str((data.get("incremental") or {}).get("base_version") or "")
+            if not kept or (primary and str(kept[0].get("base_version") or "") != primary):
                 data.pop("incremental", None)
+                log("主基线补丁不可用，剥掉 incremental 块")
+        else:
+            incremental = data.get("incremental")
+            if isinstance(incremental, dict) and incremental.get("url"):
+                patch_name = f"AALC_{version}.patch.7z"
+                meta_name = f"AALC_{version}.patch.json"
+                try:
+                    meta_path = tmp / meta_name
+                    fetch_asset(args.repo, tag, meta_name, meta_path, proxies, timeout=120)
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    fetch_asset(args.repo, tag, patch_name, tmp / patch_name, proxies, timeout=args.timeout)
+                    actual = sha256_file(tmp / patch_name)
+                    expected = str(meta.get("patch_sha256") or "")
+                    if not expected or actual != expected:
+                        raise RuntimeError(f"{patch_name} sha256 不一致")
+                    patch_names.extend([patch_name, meta_name])
+                    log(f"{patch_name} 校验通过")
+                except Exception as exc:
+                    log(f"补丁同步失败，剥掉 incremental 块：{exc!r}")
+                    data.pop("incremental", None)
 
         # 所有文件都在 tmp 里就绪，逐个原子落位
         if downloaded_full is not None:
             os.replace(downloaded_full, full_in_place)
-        if patch_ok:
-            for name in (f"AALC_{version}.patch.7z", f"AALC_{version}.patch.json"):
-                os.replace(tmp / name, dest / name)
+        for name in patch_names:
+            os.replace(tmp / name, dest / name)
         (dest / "latest.json.src").write_text(
             json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )

@@ -62,18 +62,43 @@ def main() -> int:
         "size": full.stat().st_size,
     }
 
+    entries: list[dict] = []
     if patch.is_file() and meta_path.is_file():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             meta = {}
-        if meta.get("verified") is True and meta.get("base_version"):
-            data["incremental"] = {
-                "base_version": meta["base_version"],
-                "url": f"{args.url_base}/AALC_{version}.patch.7z",
-            }
-        else:
-            print("补丁未通过自检或缺少 base_version，不写 incremental 块", file=sys.stderr)
+        # 新版元数据带 bases 数组（多基线）；老格式只有一个对象，当成单元素列表处理
+        bases = meta.get("bases") if isinstance(meta.get("bases"), list) else [meta]
+        for item in bases:
+            if not isinstance(item, dict):
+                continue
+            base_version = str(item.get("base_version") or "").strip()
+            patch_file = str(item.get("patch_file") or "").strip()
+            if item.get("verified") is not True or not base_version or not patch_file:
+                continue
+            patch_path = dist / patch_file
+            if not patch_path.is_file():
+                continue
+            entries.append(
+                {
+                    "base_version": base_version,
+                    "url": f"{args.url_base}/{patch_file}",
+                    "sha256": sha256_file(patch_path),
+                    "size": patch_path.stat().st_size,
+                }
+            )
+        if not entries:
+            print("补丁未通过自检或缺少 base_version，不写增量块", file=sys.stderr)
+
+    if entries:
+        # 第一条是主基线：保留旧的 incremental 字典，老客户端（只认这个字段）照样能用补丁；
+        # 新客户端读 incremental_list，按自己的版本挑对应基线。
+        data["incremental"] = {
+            "base_version": entries[0]["base_version"],
+            "url": entries[0]["url"],
+        }
+        data["incremental_list"] = entries
 
     output = Path(args.output) if args.output else dist / "latest.json"
     output.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

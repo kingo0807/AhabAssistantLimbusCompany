@@ -122,10 +122,23 @@ def version_key(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in match.group(1).split("."))
 
 
-def find_dist_release_base(repo: str, token: str, new_version: str):
-    """在 GitHub 的 dist-* release 里找比 new_version 小的最新一版。
+def _base_short(base_version: str) -> str:
+    """V1.6.26-dev -> 1.6.26，用来给非主基线的补丁文件名做后缀。"""
+    match = re.search(r"(\d+(?:\.\d+)*)", base_version or "")
+    return match.group(1) if match else "base"
 
-    返回 (版本号, 全量包下载地址)；没有可用基线时返回 None。
+
+def patch_file_name(stem: str, base_version: str, primary: bool) -> str:
+    """主基线沿用旧文件名（AALC_<新版本>.patch.7z），其它基线带 from-<版本> 后缀。"""
+    if primary:
+        return f"{stem}.patch.7z"
+    return f"{stem}.patch.from-{_base_short(base_version)}.7z"
+
+
+def find_dist_release_bases(repo: str, token: str, new_version: str, limit: int = 2):
+    """在 GitHub 的 dist-* release 里找比 new_version 小的、最高的 limit 个版本。
+
+    返回 [(版本号, 全量包下载地址), ...]，从新到旧；没有可用基线时返回空列表。
     这里只认 dist-* 前缀，避免把仓库里其它 v1.0.9.x 预发布当基线。
     """
     headers = dict(USER_AGENT)
@@ -139,7 +152,7 @@ def find_dist_release_base(repo: str, token: str, new_version: str):
     response.raise_for_status()
 
     new_key = version_key(new_version)
-    best = None
+    found: list[tuple[tuple[int, ...], str, str]] = []
     for release in response.json():
         tag = str(release.get("tag_name") or "")
         if not tag.startswith("dist-") or release.get("draft"):
@@ -158,10 +171,11 @@ def find_dist_release_base(repo: str, token: str, new_version: str):
         )
         if not full_asset:
             continue
-        if best is None or key > best[0]:
-            best = (key, version, full_asset["browser_download_url"])
+        found.append((key, version, full_asset["browser_download_url"]))
 
-    return None if best is None else (best[1], best[2])
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [(version, url) for _, version, url in found[: max(1, limit)]]
+
 
 
 def run_seven_zip(args: list[str], cwd: Path | None = None) -> None:
@@ -354,6 +368,12 @@ def main() -> int:
     )
     parser.add_argument("--verify", action="store_true", help="应用补丁并与新版本逐字节比对")
     parser.add_argument("--keep-work", action="store_true", help="保留临时目录（调试用）")
+    parser.add_argument(
+        "--bases",
+        type=int,
+        default=1,
+        help="给最近几个已发布版本各出一个补丁：1=只给上一版，2=上一版 + 上上版",
+    )
     args = parser.parse_args()
 
     new_package = Path(args.new).resolve()
@@ -365,35 +385,32 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     # 文件名形如 AALC_V1.6.5-dev.7z，去掉 .7z 后缀就是补丁包的前缀
     stem = new_package.stem
-    patch_package = out_dir / f"{stem}.patch.7z"
-    meta_path = out_dir / f"{stem}.patch.json"
+    new_version = stem[len("AALC_"):] if stem.startswith("AALC_") else stem
 
     work = Path(tempfile.mkdtemp(prefix="aalc-patch-"))
 
     try:
         log(f"临时目录：{work}")
-        # 第一步：拿到上一版包
-        base_version = ""
-        base_url = ""
-        base_package = None
-        # 优先从 GitHub 的 dist release 取基线：CI runner 访问 GitHub 比走自建隧道快一个数量级。
+
+        # 第一步：确定基线候选（从新到旧）。多基线是为了让「跳过一版」的客户端也能走补丁。
+        bases: list[tuple[str, str, Path | None]] = []
         if args.base_package:
-            base_package = Path(args.base_package).resolve()
-            log(f"使用本地基线包：{base_package}")
+            local_base = Path(args.base_package).resolve()
+            bases.append(("", "", local_base))
+            log(f"使用本地基线包：{local_base}")
         elif args.base_repo:
             try:
-                found = find_dist_release_base(args.base_repo, args.base_token, stem[len("AALC_"):])
-                if found:
-                    base_version, base_url = found
-                    base_package = work / "base.7z"
-                    log(f"使用 GitHub dist release 基线：{base_version}")
-                    download(base_url, base_package)
-                else:
+                for version, url in find_dist_release_bases(
+                    args.base_repo, args.base_token, new_version, args.bases
+                ):
+                    bases.append((version, url, None))
+                    log(f"使用 GitHub dist release 基线：{version}")
+                if not bases:
                     warn("dist release 里没有更早的版本，回退到清单下载基线")
             except Exception as exc:
                 warn(f"从 GitHub dist release 取基线失败，回退到清单：{exc!r}")
 
-        if base_package is None:
+        if not bases:
             response = requests.get(args.manifest, timeout=20, headers=USER_AGENT)
             response.raise_for_status()
             published = response.json()
@@ -403,71 +420,86 @@ def main() -> int:
                 warn("清单里没有 url 字段，跳过增量包生成")
                 return 0
             log(f"当前已发布版本：{base_version}")
-            base_package = work / "base.7z"
-            download(base_url, base_package)
+            bases.append((base_version, base_url, None))
 
-        # 第二步：解压 + 建索引
-        log("解压上一版...")
-        old_root = extract(base_package, work / "old")
+        # 新版本只解压一次，所有基线共用
         log("解压新版本...")
         new_root = extract(new_package, work / "new")
-
-        old_manifest = build_manifest(old_root)
+        new_top_name = new_root.name if new_root != (work / "new") else ""
         new_manifest = build_manifest(new_root)
-        log(f"文件数：old={len(old_manifest)} new={len(new_manifest)}")
 
-        # 第三步：算差异
-        changes = compute_changes(old_manifest, new_manifest)
-        payload_bytes = sum(new_manifest[path][1] for path in changes["added"] + changes["modified"])
-        total_bytes = sum(size for _, size in new_manifest.values())
-        for key in PLAN_KEYS:
-            log(f"  {key:<11}: {len(changes[key]):5d} 项")
+        # 第二步：逐个基线算差异、打补丁、自检
+        results: list[dict] = []
+        for index, (base_version, base_url, local_base) in enumerate(bases):
+            patch_package = out_dir / patch_file_name(stem, base_version, index == 0)
+            log(f"— 基线 {base_version or '本地包'} → {patch_package.name}")
+            base_work = work / f"base{index}"
+            base_work.mkdir(parents=True, exist_ok=True)
+            base_package = local_base if local_base else base_work / "base.7z"
+            if not local_base:
+                download(base_url, base_package)
 
-        if not changes["added"] and not changes["modified"] and not changes["deleted"] \
-                and not changes["deleted_dir"] and not changes["added_dir"]:
-            warn("新旧版本没有差异，跳过补丁生成")
+            old_root = extract(base_package, base_work / "old")
+            old_manifest = build_manifest(old_root)
+            log(f"文件数：old={len(old_manifest)} new={len(new_manifest)}")
+
+            changes = compute_changes(old_manifest, new_manifest)
+            payload_bytes = sum(
+                new_manifest[path][1] for path in changes["added"] + changes["modified"]
+            )
+            total_bytes = sum(size for _, size in new_manifest.values())
+            for key in PLAN_KEYS:
+                log(f"  {key:<11}: {len(changes[key]):5d} 项")
+
+            if not any(changes[key] for key in PLAN_KEYS):
+                warn("新旧版本没有差异，跳过这个基线的补丁")
+                continue
+
+            log(f"补丁载荷：{payload_bytes / 1048576:.2f} MB / 全量 {total_bytes / 1048576:.2f} MB")
+            if total_bytes and payload_bytes / total_bytes > 0.9:
+                warn("补丁载荷超过全量包的 90%，这次增量意义不大")
+
+            build_patch(new_root, new_top_name, changes, patch_package, base_work)
+            patch_size = patch_package.stat().st_size
+            log(f"补丁包：{patch_package}（{patch_size / 1048576:.2f} MB）")
+
+            verify_ok = None
+            verify_message = "未执行"
+            if args.verify:
+                verify_ok, verify_message = verify_patch(
+                    old_root, new_root, new_top_name, changes, patch_package, base_work
+                )
+                (log if verify_ok else warn)(f"验证：{verify_message}")
+                if not verify_ok:
+                    patch_package.unlink(missing_ok=True)
+
+            results.append(
+                {
+                    "base_version": base_version,
+                    "base_url": base_url,
+                    "patch_file": patch_package.name,
+                    "patch_size": patch_size,
+                    "patch_sha256": sha256_file(patch_package) if patch_package.exists() else "",
+                    "payload_bytes": payload_bytes,
+                    "full_tree_bytes": total_bytes,
+                    "verified": verify_ok,
+                    "verify_message": verify_message,
+                    "counts": {key: len(changes[key]) for key in PLAN_KEYS},
+                }
+            )
+
+        if not results:
+            warn("没有基线产出补丁，跳过元数据")
             return 0
 
-        log(f"补丁载荷：{payload_bytes / 1048576:.2f} MB / 全量 {total_bytes / 1048576:.2f} MB")
-        if total_bytes and payload_bytes / total_bytes > 0.9:
-            warn("补丁载荷超过全量包的 90%，这次增量意义不大")
-
-        # 第四步：打包
-        # 顶层目录名取自新包（正常就是 AALC），补丁里保持同名结构
-        new_top_name = new_root.name if new_root != (work / "new") else ""
-        build_patch(new_root, new_top_name, changes, patch_package, work)
-        patch_size = patch_package.stat().st_size
-        log(f"补丁包：{patch_package}（{patch_size / 1048576:.2f} MB）")
-
-        # 第五步：验证
-        verify_ok = None
-        verify_message = "未执行"
-        if args.verify:
-            verify_ok, verify_message = verify_patch(
-                old_root, new_root, new_top_name, changes, patch_package, work
-            )
-            (log if verify_ok else warn)(f"验证：{verify_message}")
-            if not verify_ok:
-                patch_package.unlink(missing_ok=True)
-
-        # 第六步：写出元数据，发布时直接读它填 latest.json
-        meta = {
-            "version": stem[len("AALC_"):] if stem.startswith("AALC_") else stem,
-            "base_version": base_version,
-            "base_url": base_url,
-            "patch_file": patch_package.name,
-            "patch_size": patch_size,
-            "patch_sha256": sha256_file(patch_package) if patch_package.exists() else "",
-            "payload_bytes": payload_bytes,
-            "full_tree_bytes": total_bytes,
-            "verified": verify_ok,
-            "verify_message": verify_message,
-            "counts": {key: len(changes[key]) for key in PLAN_KEYS},
-        }
+        # 第三步：写元数据。bases 是完整列表，顶层字段保持旧格式（= 主基线），旧脚本照样能读
+        meta: dict = {"version": new_version, "bases": results}
+        meta.update(results[0])
+        meta_path = out_dir / f"{stem}.patch.json"
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        log(f"元数据：{meta_path}")
+        log(f"元数据：{meta_path}（{len(results)} 个基线）")
 
-        if verify_ok is False:
+        if results[0].get("verified") is False:
             return 1
         return 0
     except Exception as exc:  # 构建不能因为增量包而失败，但要在界面上看得见

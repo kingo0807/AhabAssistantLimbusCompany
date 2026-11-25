@@ -214,6 +214,38 @@ class UpdateThread(QThread):
         (本次下载地址, 全量包地址)；没有命中增量时两者相同
         """
         full_url = str(data.get("url") or "")
+
+        # 多基线：incremental_list 里每条补丁都带自己的 base_version，按当前版本挑一条。
+        # 命中不了再走下面的单基线 incremental 和老逻辑。
+        entries = data.get("incremental_list")
+        if isinstance(entries, list) and entries:
+            try:
+                current = parse(cfg.version.lstrip("Vv"))
+            except Exception:
+                current = None
+            if current is not None:
+                for item in entries:
+                    if not isinstance(item, dict):
+                        continue
+                    base_version = str(item.get("base_version") or "").strip()
+                    patch_url = str(item.get("url") or "").strip()
+                    if not base_version or not patch_url or not is_valid_url(patch_url):
+                        continue
+                    try:
+                        matched = parse(base_version.lstrip("Vv")) == current
+                    except Exception:
+                        matched = False
+                    if matched:
+                        log.info(f"命中增量更新：{base_version} -> {data.get('version')}")
+                        return patch_url, full_url
+                bases = "、".join(
+                    str(item.get("base_version") or "")
+                    for item in entries
+                    if isinstance(item, dict) and item.get("base_version")
+                )
+                log.info(f"增量包基线为 {bases}，当前版本 {cfg.version}，改用全量包")
+                return full_url, full_url
+
         incremental = data.get("incremental")
         if not isinstance(incremental, dict):
             return full_url, full_url
