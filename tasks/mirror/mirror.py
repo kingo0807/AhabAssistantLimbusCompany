@@ -112,6 +112,8 @@ class Mirror:
         self.theme_pack_timing_start_count = 0  # 从卡包页开始计时的次数，标识完整计时的楼层数
         self.current_floor_start_time = None  # 当前层开始计时的时刻
         self.current_floor_time_complete = False  # 从卡包页开始计时是完整的一层计时
+        # M7（R-002）：本层开始时的四项累计值基线，层结束用当前值减它得到本层增量
+        self._floor_time_base = None
         self.floor_detect_failed = False  # 本层楼层识别已失败，进入新的层前不再重试，避免持续失败带来的卡死
         self.LOOP_COUNT = 250
 
@@ -137,6 +139,15 @@ class Mirror:
         elapsed = end_time - self.current_floor_start_time
         to_log_with_time(msg, elapsed)
         if floor > 0:
+            # M7（R-002）：本层四项增量。层秒 = 这四项 + 加载/过场，卡包统计要能扣掉
+            # 商店（每层约 20 s）和寻路这类与卡包无关的固定开销。
+            base = self._floor_time_base or (0.0, 0.0, 0.0, 0.0)
+            log.info(
+                f"[镜牢] 第{floor}层 战斗={round(self.battle_total_time - base[0], 1)} "
+                f"事件={round(self.event_total_time - base[1], 1)} "
+                f"商店={round(self.shop_total_time - base[2], 1)} "
+                f"寻路={round(self.find_road_total_time - base[3], 1)}"
+            )
             self.floor_records.append(
                 (floor, self.pack_by_floor.get(floor, ""), round(elapsed, 1), self.current_floor_time_complete)
             )
@@ -337,6 +348,12 @@ class Mirror:
                     self._log_floor_time(now, previous_floor)
                     self.current_floor_start_time = now
                     self.current_floor_time_complete = True
+                    self._floor_time_base = (
+                        self.battle_total_time,
+                        self.event_total_time,
+                        self.shop_total_time,
+                        self.find_road_total_time,
+                    )
                     self.theme_pack_timing_start_count += 1
                     theme_pack_active = True
                     preparing = False
@@ -355,6 +372,12 @@ class Mirror:
             # 中途启动时从脚本启动时刻计时；准备页面会清除此记录，等卡包页开始完整计时。
             if self.current_floor_start_time is None and not preparing:
                 self.current_floor_start_time = self.run_start_time
+                self._floor_time_base = (
+                    self.battle_total_time,
+                    self.event_total_time,
+                    self.shop_total_time,
+                    self.find_road_total_time,
+                )
 
             # 遇到选择增益事件（少见）
             if auto.click_element("mirror/road_in_mir/event_effect_button.png", threshold=0.75):
