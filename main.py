@@ -142,4 +142,12 @@ if __name__ == "__main__":
 
     QTimer.singleShot(50, lambda: lang_manager.set_language(lang))
 
+    # 5. 只读远程画面接口（给 MaixCAM2 板子/浏览器看游戏窗口，失败不影响主程序）
+    try:
+        from module.remote_view import start_view_server
+
+        start_view_server()
+    except Exception as _e:
+        log.warning(f"远程画面接口启动失败：{_e}")
+
     sys.exit(app.exec())
