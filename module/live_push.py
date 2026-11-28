@@ -5,9 +5,10 @@
 
 配置：安装目录下的 ``live_push.json``，不存在就不启动（默认关闭，避免把某台板子的地址编进发布包）。
 
-    {"url": "http://maixcam2-9d05.local:8091", "token": "<upload.txt 里的口令>", "interval": 3}
+    {"url": "http://<板子的IP>:8091", "token": "<板子 /etc/aalc-live/config.json 里的 token>", "interval": 3}
 
-token 省略时读安装目录 ``upload.txt``（和日志上传、远程画面接口同一个口令）。
+注意：这里的 token 是**板子实时日志服务**的口令，和 ``upload.txt``（KVM 上传日志用）不是同一个，
+所以不再从 ``upload.txt`` 兜底——那个兜底只会让板子回 ``bad token`` 然后静默退避。
 """
 
 from __future__ import annotations
@@ -35,32 +36,30 @@ def _app_dir() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _read_json(path: Path) -> dict:
+def _read_config(path: Path) -> tuple[dict, str]:
+    """读配置，返回 (配置, 错误说明)。容忍 BOM——PowerShell 5.1 的 -Encoding UTF8 会写 BOM。"""
+    if not path.exists():
+        return {}, ""
     try:
-        return json.loads(path.read_text("utf-8"))
-    except Exception:
-        return {}
+        return json.loads(path.read_text("utf-8-sig")), ""
+    except Exception as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
 
 
 class LivePush:
     def __init__(self, app_dir: Path | None = None):
         self.app_dir = Path(app_dir) if app_dir else _app_dir()
-        self.cfg = _read_json(self.app_dir / CONFIG_NAME)
+        self.cfg_path = self.app_dir / CONFIG_NAME
+        self.cfg, self.cfg_error = _read_config(self.cfg_path)
         self.url = str(self.cfg.get("url") or "").rstrip("/")
         self.interval = float(self.cfg.get("interval") or 3)
-        self.token = str(self.cfg.get("token") or "").strip() or self._read_token()
+        self.token = str(self.cfg.get("token") or "").strip()
         self.log_path = self.app_dir / LOG_RELATIVE
         self._offset = None
         self._ident = None
         self._pending: list[str] = []
         self._next_try = 0.0
         self._stop = threading.Event()
-
-    def _read_token(self) -> str:
-        try:
-            return (self.app_dir / TOKEN_FILE).read_text("utf-8").strip()
-        except Exception:
-            return ""
 
     # ---------- 日志读取 ----------
     def _read_new_lines(self) -> list[str]:
@@ -151,14 +150,20 @@ class LivePush:
 
 
 def start_live_push(app_dir: Path | None = None) -> threading.Thread | None:
-    """启动日志推送线程；没有 live_push.json 或没有 token 就跳过。"""
+    """启动日志推送线程；没有配置就跳过（配置有问题会打警告，不再静默）。"""
     from module.logger import log
 
     pusher = LivePush(app_dir)
+    if pusher.cfg_error:
+        log.warning(f"日志实时推送未启动：{pusher.cfg_path.name} 解析失败（{pusher.cfg_error}）")
+        return None
+    if not pusher.cfg_path.exists():
+        return None                      # 没放配置文件 = 不要这个功能，静默跳过
     if not pusher.url:
+        log.warning(f"日志实时推送未启动：{pusher.cfg_path.name} 缺少 url")
         return None
     if not pusher.token:
-        log.warning("日志实时推送未启动：没有 token（live_push.json 或 upload.txt）")
+        log.warning(f"日志实时推送未启动：{pusher.cfg_path.name} 缺少 token")
         return None
     thread = threading.Thread(target=pusher.run, name="LiveLogPush", daemon=True)
     thread.start()
