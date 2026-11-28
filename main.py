@@ -150,4 +150,12 @@ if __name__ == "__main__":
     except Exception as _e:
         log.warning(f"远程画面接口启动失败：{_e}")
 
+    # 6. 把运行日志实时推给板子（安装目录有 live_push.json 才启用）
+    try:
+        from module.live_push import start_live_push
+
+        start_live_push()
+    except Exception as _e:
+        log.warning(f"日志实时推送启动失败：{_e}")
+
     sys.exit(app.exec())
